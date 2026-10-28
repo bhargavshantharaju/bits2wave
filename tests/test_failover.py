@@ -174,19 +174,12 @@ class FailoverTests(unittest.TestCase):
         self.assertEqual(count["dest"], 1)
         self.assertEqual(self.store.pending_count(), 0)
 
-    def test_production_database_is_not_opened_or_mutated(self):
-        production = os.path.join(os.path.dirname(__file__), "..", "database", "nexalert.db")
-        if not os.path.exists(production):
-            self.skipTest("production database is not present in this checkout")
-        import hashlib
-        def digest(path):
-            h=hashlib.sha256()
-            with open(path,"rb") as stream:
-                for block in iter(lambda:stream.read(1024*1024),b""): h.update(block)
-            return h.hexdigest()
-        before=digest(production)
+    def test_fallback_store_is_confined_to_its_temporary_database(self):
+        production = os.path.realpath(os.path.join(os.path.dirname(__file__), "..", "database", "nexalert.db"))
+        self.assertNotEqual(os.path.realpath(self.store.path), production)
         self.store.accept(self.report("INC-temp-only"), "esp32-sim", self.clock())
-        self.assertEqual(digest(production), before)
+        self.assertTrue(os.path.isfile(self.path))
+        self.assertEqual(self.store.pending()[0]["incident_id"], "INC-temp-only")
 
 
 if __name__ == "__main__": unittest.main()

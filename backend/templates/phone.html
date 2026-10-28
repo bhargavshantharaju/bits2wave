@@ -19,13 +19,11 @@
       <form id="join-form" class="join-form">
         <label for="reg-name">Name <small>(optional)</small></label>
         <input id="reg-name" maxlength="200" autocomplete="name" placeholder="How should we identify you?">
-        <label for="reg-role">Network role</label>
-        <select id="reg-role"><option value="civilian" selected>Civilian</option><option value="responder">Responder</option><option value="operator">Operator</option></select>
-        <button class="primary-button" type="submit">JOIN NETWORK <span aria-hidden="true">→</span></button>
+        <button class="primary-button" type="submit">CONTINUE PRIVATELY <span aria-hidden="true">→</span></button>
       </form>
       <p id="reg-error" class="notice" role="status" aria-live="polite"></p>
-      <button id="guest-continue" class="text-button" type="button">Continue to emergency tools without joining</button>
-      <p class="privacy-note">No phone number or location is required. Location is requested only if you choose to attach it to an SOS.</p>
+      <button id="guest-continue" class="text-button" type="button">Continue now; create a temporary identity when needed</button>
+      <p class="privacy-note">This creates a temporary pseudonymous identity on this server. If this device loses its session, that identity cannot be recovered by display name. No phone number or location is required.</p>
     </div>
   </section>
 
@@ -33,13 +31,13 @@
     <header class="app-header">
       <a class="mini-brand" href="#" aria-label="NexAlert home"><span class="mini-mark">⌁</span><strong>NEX<span>ALERT</span></strong></a>
       <div class="header-status"><span class="status-dot" id="app-server-dot"></span><span id="app-server-status">Server checking</span><span class="header-divider"></span><span id="app-transport-status">SIMULATED LINK</span></div>
-      <div id="user-display" class="user-chip">Guest</div>
+      <div><span id="user-display" class="user-chip">Guest</span><button id="session-logout" class="text-button" type="button" hidden>Leave session</button></div>
     </header>
 
     <main class="tab-content">
       <section id="tab-chat" class="tab-panel active" aria-label="Chat">
         <div class="panel-heading"><div><p class="eyebrow">NETWORK MESSAGES</p><h2>Chat</h2></div><span id="online-count" class="count-pill">— online</span></div>
-        <div class="chat-toolbar"><label class="sr-only" for="chat-recipient">Send to</label><select id="chat-recipient"><option value="">Network broadcast</option></select></div>
+        <div class="chat-toolbar"><label class="sr-only" for="chat-recipient">Recipient temporary ID</label><input id="chat-recipient" placeholder="Recipient temporary ID" autocomplete="off"></div>
         <div id="chat-state" class="inline-state" role="status">Loading messages…</div>
         <div id="messages-container" class="messages-list" aria-live="polite"></div>
         <form id="message-form" class="chat-input-bar"><label class="sr-only" for="msg-input">Message</label><input id="msg-input" maxlength="500" placeholder="Write a message…" autocomplete="off"><button class="btn-send" aria-label="Send message" type="submit">↑</button></form>
@@ -48,7 +46,7 @@
       <section id="tab-call" class="tab-panel" aria-label="Voice call" hidden>
         <div class="panel-heading"><div><p class="eyebrow">LOCAL WI-FI AUDIO</p><h2>Call</h2></div><span class="feature-state">BROWSER CALL</span></div>
         <p id="call-security-note" class="call-note">Calls require trusted HTTPS or localhost. Signalling uses the current app session, but registration has no verified identity credentials; do not use prototype calls for sensitive communication. Microphone access is requested only after you start or accept.</p>
-        <label class="field-label" for="call-participant">Participant</label><select id="call-participant" class="large-control"><option value="">Choose an online participant</option></select>
+        <label class="field-label" for="call-participant">Participant temporary ID</label><input id="call-participant" class="large-control" placeholder="citizen-…" autocomplete="off">
         <div id="incoming-call" class="incoming-call" hidden><p><strong id="incoming-caller">Incoming call</strong></p><button id="accept-call" class="primary-button" type="button">Accept call</button><button id="decline-call" class="secondary-button" type="button">Decline</button></div>
         <div class="call-orb" aria-hidden="true"><span>☎</span></div>
         <audio id="remote-audio" autoplay playsinline></audio>

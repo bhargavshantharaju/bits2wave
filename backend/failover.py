@@ -167,7 +167,8 @@ class FallbackStore:
                     incident_id TEXT PRIMARY KEY, source_node_id TEXT NOT NULL,
                     alert_type TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
                     latitude REAL, longitude REAL, landmark TEXT NOT NULL DEFAULT '',
-                    created_at TEXT NOT NULL, local_receipt_id TEXT NOT NULL UNIQUE);
+                    created_at TEXT NOT NULL, local_receipt_id TEXT NOT NULL UNIQUE,
+                    citizen_user_id INTEGER);
                 CREATE TABLE IF NOT EXISTS fallback_outbox(
                     incident_id TEXT PRIMARY KEY REFERENCES fallback_incidents(incident_id),
                     state TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
@@ -184,6 +185,9 @@ class FallbackStore:
                     id INTEGER PRIMARY KEY AUTOINCREMENT, from_state TEXT NOT NULL,
                     to_state TEXT NOT NULL, reason TEXT NOT NULL, changed_at REAL NOT NULL);
             """)
+            columns={row[1] for row in db.execute("PRAGMA table_info(fallback_incidents)")}
+            if "citizen_user_id" not in columns:
+                db.execute("ALTER TABLE fallback_incidents ADD COLUMN citizen_user_id INTEGER")
 
     def connect(self):
         db = sqlite3.connect(self.path, timeout=10)
@@ -234,6 +238,9 @@ class FallbackStore:
                 raise FailoverError("coordinates are outside valid ranges")
         if not isinstance(source_node_id, str) or not source_node_id or len(source_node_id) > 80:
             raise FailoverError("source_node_id is required")
+        citizen_user_id=report.get("citizen_user_id")
+        if citizen_user_id is not None and (isinstance(citizen_user_id,bool) or not isinstance(citizen_user_id,int) or citizen_user_id<1):
+            raise FailoverError("citizen identity is invalid")
         created_at = created_at or __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat()
         local_receipt = "LOCAL-" + incident_id
         db = self.connect()
@@ -243,12 +250,16 @@ class FallbackStore:
             if before:
                 if before["source_node_id"] != source_node_id:
                     raise FailoverError("incident_id already belongs to another source node")
+                if before["citizen_user_id"] != citizen_user_id:
+                    raise FailoverError("incident_id already belongs to another citizen")
                 db.commit()
                 status = db.execute("SELECT state,command_receipt_id FROM fallback_outbox WHERE incident_id=?", (incident_id,)).fetchone()
                 return self._local_response(before, status["state"], status["command_receipt_id"]), False
-            db.execute("INSERT INTO fallback_incidents VALUES(?,?,?,?,?,?,?,?,?)",
+            db.execute("""INSERT INTO fallback_incidents
+                (incident_id,source_node_id,alert_type,description,latitude,longitude,landmark,created_at,local_receipt_id,citizen_user_id)
+                VALUES(?,?,?,?,?,?,?,?,?,?)""",
                 (incident_id, source_node_id, alert_type, description.strip(), lat, lon,
-                 landmark.strip(), created_at, local_receipt))
+                 landmark.strip(), created_at, local_receipt, citizen_user_id))
             db.execute("INSERT INTO fallback_outbox(incident_id,state,last_attempt_at) VALUES(?,'pending',NULL)", (incident_id,))
             row = db.execute("SELECT * FROM fallback_incidents WHERE incident_id=?", (incident_id,)).fetchone()
             db.commit()
@@ -272,6 +283,17 @@ class FallbackStore:
         with self.connection() as db:
             rows = db.execute("SELECT i.*,o.attempts FROM fallback_incidents i JOIN fallback_outbox o USING(incident_id) WHERE o.state='pending' ORDER BY i.created_at,i.incident_id").fetchall()
             return [dict(row) for row in rows]
+
+    def incidents_for_user(self, citizen_user_id: int):
+        with self.connection() as db:
+            rows=db.execute("""SELECT i.*,o.state,o.command_receipt_id FROM fallback_incidents i
+                JOIN fallback_outbox o USING(incident_id) WHERE i.citizen_user_id=?
+                ORDER BY i.created_at DESC""",(citizen_user_id,)).fetchall()
+            return [{"incident_id":r["incident_id"],"source_node_id":r["source_node_id"],
+                     "alert_type":r["alert_type"],"description":r["description"],
+                     "latitude":r["latitude"],"longitude":r["longitude"],"landmark":r["landmark"],
+                     "created_at":r["created_at"],"delivery_status":"received_by_command_centre" if r["state"]=="received" else "queued_on_backup",
+                     "receipt_id":r["command_receipt_id"]} for r in rows]
 
     def pending_count(self) -> int:
         with self.connection() as db:

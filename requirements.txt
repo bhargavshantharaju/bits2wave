@@ -1,5 +1,5 @@
 # NexAlert v3.0 Requirements
-# Pinned for Raspberry Pi / Python 3.9–3.11 compatibility
+# Pinned application dependencies. The source requires Python 3.10 or newer.
 #
 # DO NOT add eventlet or gevent — they conflict with GPIO libs
 # and require monkey-patching that breaks BalenaOS containers.
@@ -7,7 +7,6 @@
 
 Flask==3.0.3
 Flask-SocketIO==5.3.6
-Flask-Cors==4.0.1
 python-socketio==5.11.2
 python-engineio==4.9.1
 

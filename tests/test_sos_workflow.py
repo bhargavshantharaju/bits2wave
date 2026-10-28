@@ -8,8 +8,13 @@ import importlib.util
 import json
 import os
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import unittest
+from datetime import timedelta
+from flask.testing import FlaskClient
+from werkzeug.security import generate_password_hash
 
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -17,6 +22,28 @@ APP_PATH = os.path.join(ROOT, "backend", "app.py")
 SPEC = importlib.util.spec_from_file_location("nexalert_app", APP_PATH)
 appmod = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(appmod)
+
+
+class CsrfTestClient(FlaskClient):
+    def open(self, *args, **kwargs):
+        without_csrf=kwargs.pop("without_csrf",False)
+        method=(kwargs.get("method") or "GET").upper()
+        if not without_csrf and method not in {"GET","HEAD","OPTIONS"}:
+            try:
+                with self.session_transaction() as current_session:
+                    token=current_session.get("csrf_token")
+                if token:
+                    headers=dict(kwargs.get("headers") or {})
+                    headers.setdefault("X-CSRF-Token",token)
+                    kwargs["headers"]=headers
+            except Exception:
+                pass
+        return super().open(*args,**kwargs)
+
+
+appmod.app.test_client_class=CsrfTestClient
+TEST_OPERATOR_PASSWORD="test-only-operator-password"
+TEST_OPERATOR_HASH=generate_password_hash(TEST_OPERATOR_PASSWORD,method="scrypt")
 
 
 class AppFakeRadioLink:
@@ -62,7 +89,9 @@ class SosWorkflowTests(unittest.TestCase):
         appmod.app.config.update(TESTING=True)
         appmod.init_db()
         self.client = appmod.app.test_client()
-        self.register("citizen")
+        self.client.get("/api/csrf")
+        self.register("Test Citizen")
+        self.operator_client=self.provision_operator()
 
     def tearDown(self):
         appmod.DB_PATH = self.old_db_path
@@ -71,15 +100,27 @@ class SosWorkflowTests(unittest.TestCase):
         appmod.app.config.update(TESTING=self.old_testing)
         self.tmp.cleanup()
 
-    def register(self, username):
-        response = self.client.post("/api/register", json={
-            "username": username, "full_name": "Test Citizen", "phone": "+910000000000",
-        })
-        self.assertIn(response.status_code, (200, 201))
+    def register(self, display_name="Test Citizen", client=None):
+        client=client or self.client
+        if not client.get("/api/csrf").is_json:
+            self.fail("CSRF bootstrap failed")
+        response = client.post("/api/register", json={"display_name":display_name})
+        self.assertEqual(response.status_code,201,response.get_json())
+        return response.get_json()["user"]
+
+    def provision_operator(self):
+        db=sqlite3.connect(appmod.DB_PATH)
+        db.execute("INSERT INTO users(username,full_name,phone,role,password_hash) VALUES(?,?,'','operator',?)",
+                   ("operator-test","Test Operator",TEST_OPERATOR_HASH))
+        db.commit();db.close()
+        client=appmod.app.test_client();client.get("/api/csrf")
+        response=client.post("/api/operator/login",json={"username":"operator-test","password":TEST_OPERATOR_PASSWORD})
+        if response.status_code!=200:raise AssertionError(response.get_json())
+        return client
 
     def sos(self, incident_id="INC-test-incident", **extra):
         payload = {
-            "username": "citizen", "incident_id": incident_id,
+            "incident_id": incident_id,
             "alert_type": "medical", "description": "Needs help",
             "latitude": 12.9, "longitude": 77.5,
         }
@@ -194,7 +235,7 @@ class SosWorkflowTests(unittest.TestCase):
         dashboard = self.client.get("/api/incidents").get_json()
         incident = next(item for item in dashboard if item["incident_id"] == "INC-app-radio-accepted")
         self.assertEqual(incident["delivery_status"], "received_by_command_centre")
-        assigned = self.client.post("/api/incidents/INC-app-radio-accepted/assign",
+        assigned = self.operator_client.post("/api/incidents/INC-app-radio-accepted/assign",
                                     json={"responder": "Radio Test Unit"})
         self.assertEqual(assigned.get_json()["lifecycle_status"], "responder_assigned")
         self.assertEqual(self.db_rows("SELECT delivery_status,lifecycle_status FROM alerts WHERE incident_id=?",
@@ -279,9 +320,9 @@ class SosWorkflowTests(unittest.TestCase):
         ctl = appmod.failover_controller
         ctl.monitor.last_received_at -= 30
         ctl.set_simulation(primary_running=False, drop_heartbeats=True)
-        self.client.get("/api/failover/status")  # timeout -> activating
+        self.operator_client.get("/api/failover/status")  # timeout -> activating
         ctl.activation_started_at -= 3
-        self.client.get("/api/failover/status")  # readiness -> active
+        self.operator_client.get("/api/failover/status")  # readiness -> active
         self.assertTrue(ctl.fallback_service_ready)
 
     def test_fallback_sos_api_persists_locally_before_acceptance(self):
@@ -293,11 +334,14 @@ class SosWorkflowTests(unittest.TestCase):
         self.assertEqual(body["status"], "accepted_locally")
         self.assertIsNone(body["command_centre_receipt"])
         self.assertEqual(appmod.fallback_store.pending_count(), 1)
+        self.assertEqual(self.client.get("/api/fallback/incidents").get_json()[0]["incident_id"],"INC-fallback-api")
+        other=appmod.app.test_client();other.get("/api/csrf");self.register("Fallback bystander",other)
+        self.assertEqual(other.get("/api/fallback/incidents").get_json(),[])
 
     def test_dashboard_failover_api_reports_persisted_runtime_and_queue(self):
         self.activate_fallback_api()
         self.client.post("/api/fallback/sos", json={"incident_id": "INC-dashboard-fallback", "alert_type": "other"})
-        state = self.client.get("/api/failover/status").get_json()
+        state = self.operator_client.get("/api/failover/status").get_json()
         self.assertEqual(state["state"], "FALLBACK_ACTIVE")
         self.assertEqual(state["pending_fallback_incidents"], 1)
         self.assertFalse(state["physical_hardware_verified"])
@@ -307,10 +351,13 @@ class SosWorkflowTests(unittest.TestCase):
         appmod.app.config.update(TESTING=False)
         try:
             appmod.init_db()
-            response = self.client.post("/api/failover/simulate", json={"action": "power_off"})
+            response = self.operator_client.post("/api/failover/simulate", json={"action": "power_off"})
             self.assertEqual(response.status_code, 404)
         finally:
             appmod.app.config.update(TESTING=old_testing)
+            # Rebuild process-local controller references against this test's
+            # isolated database; later tests replace all three database paths.
+            appmod.init_db()
 
     def test_failed_recovery_transfer_keeps_backup_outbox(self):
         self.activate_fallback_api()
@@ -318,8 +365,8 @@ class SosWorkflowTests(unittest.TestCase):
         ctl = appmod.failover_controller
         ctl.set_simulation(primary_running=True, primary_ready=True, drop_heartbeats=False)
         ctl.tick(); ctl.tick()
-        self.client.post("/api/failover/simulate", json={"action": "fail_next_transfer"})
-        result = self.client.post("/api/failover/simulate", json={"action": "sync"})
+        self.operator_client.post("/api/failover/simulate", json={"action": "fail_next_transfer"})
+        result = self.operator_client.post("/api/failover/simulate", json={"action": "sync"})
         self.assertEqual(result.get_json()["pending"], 1)
         self.assertEqual(appmod.fallback_store.pending_count(), 1)
         self.assertEqual(ctl.state.value, "DEGRADED")
@@ -328,13 +375,13 @@ class SosWorkflowTests(unittest.TestCase):
         self.activate_fallback_api()
         report = self.client.post("/api/fallback/sos", json={
             "incident_id": "INC-fallback-sync", "alert_type": "flood", "description": "rising water"})
-        self.assertEqual(report.status_code, 201)
+        self.assertEqual(report.status_code, 201, report.get_json())
         ctl = appmod.failover_controller
         ctl.set_simulation(primary_running=True, primary_ready=True, drop_heartbeats=False)
         ctl.tick()  # authenticated heartbeat -> recovery
         ctl.tick()  # readiness -> syncing
         self.assertEqual(ctl.state.value, "SYNCING_INCIDENTS")
-        response = self.client.post("/api/failover/simulate", json={"action": "sync"})
+        response = self.operator_client.post("/api/failover/simulate", json={"action": "sync"})
         self.assertEqual(response.status_code, 200, response.get_json())
         cc = __import__('sqlite3').connect(appmod.CC_DB_PATH)
         try:
@@ -351,11 +398,11 @@ class SosWorkflowTests(unittest.TestCase):
         ctl = appmod.failover_controller
         ctl.set_simulation(primary_running=True, primary_ready=True, drop_heartbeats=False)
         ctl.tick(); ctl.tick()
-        self.client.post("/api/failover/simulate", json={"action":"lose_next_ack"})
-        first = self.client.post("/api/failover/simulate", json={"action":"sync"})
+        self.operator_client.post("/api/failover/simulate", json={"action":"lose_next_ack"})
+        first = self.operator_client.post("/api/failover/simulate", json={"action":"sync"})
         self.assertEqual(first.get_json()["pending"], 1)
         self.assertEqual(appmod.fallback_store.pending_count(), 1)
-        second = self.client.post("/api/failover/simulate", json={"action":"sync"})
+        second = self.operator_client.post("/api/failover/simulate", json={"action":"sync"})
         # The first failed reconciliation leaves the controller degraded; a fresh
         # primary heartbeat/readiness cycle is required before retrying.
         self.assertEqual(second.status_code, 409)
@@ -363,7 +410,7 @@ class SosWorkflowTests(unittest.TestCase):
         ctl.monitor.last_received_at -= 6
         ctl.tick(); ctl.tick()
         self.assertEqual(ctl.state.value, "SYNCING_INCIDENTS")
-        retry = self.client.post("/api/failover/simulate", json={"action": "sync"})
+        retry = self.operator_client.post("/api/failover/simulate", json={"action": "sync"})
         self.assertEqual(retry.status_code, 200, retry.get_json())
         cc = __import__('sqlite3').connect(appmod.CC_DB_PATH)
         try:
@@ -372,34 +419,36 @@ class SosWorkflowTests(unittest.TestCase):
         self.assertEqual(count, 1)
         self.assertEqual(appmod.fallback_store.pending_count(), 0)
 
-    def test_registration_persists_selected_role(self):
-        response = self.client.post("/api/register", json={
-            "username": "responder", "full_name": "Unit 4", "role": "responder",
-        })
-        self.assertEqual(response.status_code, 201)
-        self.assertEqual(response.get_json()["user"]["role"], "responder")
-        invalid = self.client.post("/api/register", json={
-            "username": "bad-role", "role": "root",
-        })
-        self.assertEqual(invalid.status_code, 400)
+    def test_public_registration_cannot_select_username_or_role(self):
+        invalid = self.client.post("/api/register", json={"username":"operator-test","role":"operator"})
+        self.assertEqual(invalid.status_code,400)
+        self.assertEqual(self.client.get("/api/session").get_json()["user"]["role"],"citizen")
+        another=appmod.app.test_client();another.get("/api/csrf")
+        user=self.register("Test Citizen",another)
+        self.assertNotEqual(user["id"],self.client.get("/api/session").get_json()["user"]["id"])
 
     def test_dashboard_broadcast_is_validated_persisted_and_local_only(self):
-        invalid = self.client.post("/api/announcements", json={"content": " ", "category": "broadcast"})
+        forbidden=self.client.post("/api/announcements",json={"content":"Public spoof","category":"all_clear"})
+        self.assertEqual(forbidden.status_code,403)
+        invalid = self.operator_client.post("/api/announcements", json={"content": " ", "category": "broadcast"})
         self.assertEqual(invalid.status_code, 400)
-        response = self.client.post("/api/announcements", json={
-            "content": "Flood alert", "category": "flood_alert",
+        response = self.operator_client.post("/api/announcements", json={
+            "content": "Flood alert", "category": "flood_alert", "actor_id":999999,
         })
         self.assertEqual(response.status_code, 201)
         body = response.get_json()
         self.assertEqual(body["delivery"], "local_application_only")
         rows = self.client.get("/api/announcements").get_json()
         self.assertEqual(rows[0]["content"], "Flood alert")
+        operator=self.operator_client.get("/api/session").get_json()["user"]
+        stored=self.db_rows("SELECT created_by FROM system_announcements WHERE id=?",(body["announcement"]["id"],))[0]
+        self.assertEqual(stored["created_by"],operator["id"])
 
     def test_dashboard_status_reports_simulated_transport_and_real_summary(self):
         status = self.client.get("/api/status").get_json()
         self.assertEqual(status["transport"], "simulated")
         self.assertFalse(status["radio_verified"])
-        summary = self.client.get("/api/dashboard/summary").get_json()
+        summary = self.operator_client.get("/api/dashboard/summary").get_json()
         self.assertIn("online_participants", summary)
         self.assertIn("messages", summary)
         self.assertIn("sos_today", summary)
@@ -408,47 +457,166 @@ class SosWorkflowTests(unittest.TestCase):
     def test_citizen_and_dashboard_templates_expose_required_controls(self):
         citizen = self.client.get("/")
         self.assertEqual(citizen.status_code, 200)
-        for marker in ("JOIN NETWORK", "CHAT", "CALL", "SOS", "MAP", "call-participant", "sos-grid"):
+        for marker in ("CONTINUE PRIVATELY", "CHAT", "CALL", "SOS", "MAP", "call-participant", "sos-grid"):
             self.assertIn(marker.encode(), citizen.data)
         self.assertEqual(self.client.get("/static/js/socket-client.js").status_code, 200)
         worker = self.client.get("/service-worker.js")
         self.assertEqual(worker.status_code, 200)
         self.assertEqual(worker.headers.get("Service-Worker-Allowed"), "/")
-        dashboard = self.client.get("/dashboard")
+        self.assertEqual(self.client.get("/dashboard").status_code,302)
+        dashboard = self.operator_client.get("/dashboard")
         self.assertEqual(dashboard.status_code, 200)
         for marker in ("Incident Map", "SEND TO ALL", "CYCLONE WARNING", "activity-feed", "stat-uptime"):
             self.assertIn(marker.encode(), dashboard.data)
 
     def test_chat_post_is_saved_and_returned_by_real_message_api(self):
-        response = self.client.post("/api/messages", json={
-            "sender": "citizen", "content": "Test message", "is_broadcast": 1,
-        })
+        recipient_client=appmod.app.test_client();recipient_client.get("/api/csrf")
+        recipient=self.register("Recipient",recipient_client)
+        response = self.client.post("/api/messages", json={"recipient":recipient["username"],"content":"Test message"})
         self.assertEqual(response.status_code, 201)
         message = response.get_json()["message"]
-        rows = self.client.get("/api/messages?username=citizen").get_json()
+        rows = self.client.get("/api/messages?username=operator-test").get_json()
         self.assertTrue(any(row["id"] == message["id"] and row["content"] == "Test message" for row in rows))
+        self.assertEqual(recipient_client.get("/api/messages?username=operator-test").status_code,200)
+        self.assertTrue(any(row["id"]==message["id"] for row in recipient_client.get("/api/messages").get_json()))
+        self.assertEqual(self.operator_client.get("/api/messages").status_code,403)
+
+    def test_anonymous_and_citizen_private_endpoints_are_scoped(self):
+        anonymous=appmod.app.test_client()
+        self.assertEqual(anonymous.get("/api/incidents").status_code,401)
+        self.assertEqual(anonymous.get("/api/users").status_code,401)
+        self.assertEqual(self.client.get("/api/users").status_code,403)
+        self.assertEqual(self.client.get("/api/alerts").status_code,403)
+
+    def test_citizen_cannot_read_or_overwrite_another_citizens_incident(self):
+        response=self.sos("INC-owned-by-first")
+        self.assertEqual(response.status_code,201,response.get_json())
+        owner=appmod.app.test_client();owner.get("/api/csrf")
+        other=self.register("Other citizen",owner)
+        self.assertEqual(owner.get("/api/incidents/INC-owned-by-first").status_code,404)
+        self.assertEqual(owner.get("/api/incidents").get_json(),[])
+        denied=owner.post("/api/incidents/INC-owned-by-first/updates",json={"description":"stolen"})
+        self.assertEqual(denied.status_code,404)
+        spoof=owner.post("/api/sos",json={"incident_id":"INC-forged-owner","user_id":self.client.get("/api/session").get_json()["user"]["id"],"description":"spoof"})
+        self.assertEqual(spoof.status_code,400)
+        saved=self.db_rows("SELECT description,user_id FROM alerts WHERE incident_id=?",("INC-owned-by-first",))[0]
+        self.assertEqual(saved["description"],"Needs help")
+        self.assertNotEqual(saved["user_id"],other["id"])
+
+    def test_message_query_cannot_select_another_users_conversation(self):
+        target=appmod.app.test_client();target.get("/api/csrf")
+        target_user=self.register("Target",target)
+        sent=self.client.post("/api/messages",json={"recipient":target_user["username"],"content":"private"})
+        self.assertEqual(sent.status_code,201)
+        unrelated=appmod.app.test_client();unrelated.get("/api/csrf");self.register("Unrelated",unrelated)
+        self.assertEqual(unrelated.get("/api/messages?username="+target_user["username"]).get_json(),[])
+
+    def test_private_message_socket_event_reaches_only_sender_and_recipient(self):
+        recipient=appmod.app.test_client();recipient.get("/api/csrf")
+        recipient_user=self.register("Socket recipient",recipient)
+        bystander=appmod.app.test_client();bystander.get("/api/csrf");self.register("Socket bystander",bystander)
+        sender_socket=appmod.socketio.test_client(appmod.app,flask_test_client=self.client)
+        recipient_socket=appmod.socketio.test_client(appmod.app,flask_test_client=recipient)
+        bystander_socket=appmod.socketio.test_client(appmod.app,flask_test_client=bystander)
+        sent=self.client.post("/api/messages",json={"recipient":recipient_user["username"],"content":"private socket text"})
+        self.assertEqual(sent.status_code,201)
+        self.assertTrue(any(e["name"]=="new_message" for e in sender_socket.get_received()))
+        self.assertTrue(any(e["name"]=="new_message" for e in recipient_socket.get_received()))
+        self.assertFalse(any(e["name"]=="new_message" for e in bystander_socket.get_received()))
+        sender_socket.disconnect();recipient_socket.disconnect();bystander_socket.disconnect()
+
+    def test_citizens_cannot_change_incident_lifecycle_and_operator_actor_is_server_bound(self):
+        response=self.sos("INC-audited-action")
+        incident=response.get_json()["alert"]
+        self.assertEqual(self.client.post("/api/incidents/INC-audited-action/assign",json={"responder":"Crew"}).status_code,403)
+        self.assertEqual(self.client.post("/api/incidents/INC-audited-action/lifecycle",json={"status":"resolved"}).status_code,403)
+        row=self.db_rows("SELECT id FROM alerts WHERE incident_id=?",("INC-audited-action",))[0]
+        self.assertEqual(self.operator_client.post("/api/incidents/INC-audited-action/assign",json={"responder":"Crew","actor_id":999999}).status_code,200)
+        action=self.db_rows("SELECT actor_id,action FROM operator_actions WHERE target_incident_id=? ORDER BY id DESC LIMIT 1",("INC-audited-action",))[0]
+        operator=self.operator_client.get("/api/session").get_json()["user"]
+        self.assertEqual(action["actor_id"],operator["id"])
+        self.assertEqual(action["action"],"assign_responder")
+
+    def test_socket_incident_events_are_limited_to_operator_audience(self):
+        citizen_socket=appmod.socketio.test_client(appmod.app,flask_test_client=self.client)
+        operator_socket=appmod.socketio.test_client(appmod.app,flask_test_client=self.operator_client)
+        citizen_socket.emit("join",{"room":"operators"})
+        for event in citizen_socket.get_received():
+            self.assertNotEqual(event["name"],"new_alert")
+        response=self.sos("INC-socket-private")
+        self.assertEqual(response.status_code,201)
+        citizen_events=citizen_socket.get_received()
+        operator_events=operator_socket.get_received()
+        self.assertFalse(any(e["name"]=="new_alert" for e in citizen_events))
+        alert_event=next(e for e in operator_events if e["name"]=="new_alert")
+        self.assertEqual(alert_event["args"][0]["incident_id"],"INC-socket-private")
+        citizen_socket.disconnect();operator_socket.disconnect()
+
+    def test_csrf_logout_revocation_and_cookie_policy(self):
+        cookie=self.client.get_cookie("nexalert_session")
+        self.assertTrue(cookie.http_only)
+        self.assertEqual(cookie.same_site,"Lax")
+        missing=self.client.post("/api/announcements",json={"content":"x"},without_csrf=True)
+        self.assertEqual(missing.status_code,403)
+        wrong=self.client.post("/api/logout",json={},headers={"X-CSRF-Token":"tampered"})
+        self.assertEqual(wrong.status_code,403)
+        stale=appmod.app.test_client()
+        stale.set_cookie("nexalert_session",cookie.value)
+        response=self.client.post("/api/logout",json={})
+        self.assertEqual(response.status_code,200)
+        self.assertEqual(stale.get("/api/session").status_code,401)
+
+    def test_expired_session_cookie_cannot_access_authenticated_routes(self):
+        cookie=self.client.get_cookie("nexalert_session")
+        expired=appmod.app.test_client();expired.set_cookie("nexalert_session",cookie.value)
+        old_lifetime=appmod.app.config["PERMANENT_SESSION_LIFETIME"]
+        try:
+            appmod.app.config["PERMANENT_SESSION_LIFETIME"]=timedelta(seconds=-1)
+            self.assertEqual(expired.get("/api/session").status_code,401)
+            self.assertEqual(expired.get("/api/incidents").status_code,401)
+        finally:
+            appmod.app.config["PERMANENT_SESSION_LIFETIME"]=old_lifetime
+
+    def test_public_pages_health_and_announcement_reads_remain_available(self):
+        public=appmod.app.test_client()
+        self.assertEqual(public.get("/").status_code,200)
+        self.assertEqual(public.get("/health").status_code,200)
+        self.assertEqual(public.get("/api/announcements").status_code,200)
+
+    def test_deployment_startup_fails_closed_without_a_strong_secret(self):
+        base=dict(os.environ)
+        for key in ("NEXALERT_SECRET","NEXALERT_HTTPS","NEXALERT_TRUST_PROXY"):
+            base.pop(key,None)
+        base.update({"NEXALERT_ENV":"production",
+                     "NEXALERT_DB":os.path.join(self.tmp.name,"startup.db"),
+                     "NEXALERT_CC_DB":os.path.join(self.tmp.name,"startup-cc.db"),
+                     "NEXALERT_LOG_DIR":os.path.join(self.tmp.name,"logs")})
+        for secret in (None,"too-short"):
+            env=dict(base)
+            if secret is not None:env["NEXALERT_SECRET"]=secret
+            result=subprocess.run([sys.executable,"-c","import backend.app"],cwd=ROOT,env=env,
+                                  text=True,capture_output=True,timeout=15)
+            self.assertNotEqual(result.returncode,0)
+            self.assertIn("NEXALERT_SECRET must contain at least 32 bytes",result.stderr)
 
     def test_call_signalling_rejects_socket_without_session(self):
         socket_client = appmod.socketio.test_client(appmod.app)
-        socket_client.emit("call:invite", {"to": "citizen"})
-        events = socket_client.get_received()
-        self.assertTrue(any(e["name"] == "call:error" for e in events))
-        socket_client.disconnect()
+        self.assertFalse(socket_client.is_connected())
 
     def test_session_bound_call_signalling_invite_accept_and_end(self):
         caller_http = appmod.app.test_client()
         callee_http = appmod.app.test_client()
-        self.assertEqual(caller_http.post("/api/register", json={"username": "caller"}).status_code, 201)
-        self.assertEqual(callee_http.post("/api/register", json={"username": "callee"}).status_code, 201)
+        caller_user=self.register("Caller",caller_http)
+        callee_user=self.register("Callee",callee_http)
         caller = appmod.socketio.test_client(appmod.app, flask_test_client=caller_http)
         callee = appmod.socketio.test_client(appmod.app, flask_test_client=callee_http)
-        caller.emit("call:invite", {"to": "callee"})
+        caller.emit("call:invite", {"to": callee_user["username"]})
         self.assertTrue(any(e["name"] == "call:invite" for e in callee.get_received()))
-        callee.emit("call:accept", {"to": "caller"})
+        callee.emit("call:accept", {"to": caller_user["username"]})
         self.assertTrue(any(e["name"] == "call:accepted" for e in caller.get_received()))
-        caller.emit("call:signal", {"to": "callee", "kind": "offer", "data": {"type": "offer", "sdp": "test"}})
+        caller.emit("call:signal", {"to": callee_user["username"], "kind": "offer", "data": {"type": "offer", "sdp": "test"}})
         self.assertTrue(any(e["name"] == "call:signal" for e in callee.get_received()))
-        caller.emit("call:end", {"to": "callee"})
+        caller.emit("call:end", {"to": callee_user["username"]})
         self.assertTrue(any(e["name"] == "call:ended" for e in callee.get_received()))
         caller.disconnect()
         callee.disconnect()
@@ -520,7 +688,8 @@ class SosWorkflowTests(unittest.TestCase):
         self.sos("INC-assignment")
         before = self.db_rows("SELECT delivery_status FROM alerts WHERE incident_id=?", ("INC-assignment",))[0][0]
         self.assertEqual(before, "received_by_command_centre")
-        response = self.client.post("/api/incidents/INC-assignment/assign", json={"responder": "Unit 7"})
+        self.assertEqual(self.client.post("/api/incidents/INC-assignment/assign",json={"responder":"Unit 7"}).status_code,403)
+        response = self.operator_client.post("/api/incidents/INC-assignment/assign", json={"responder": "Unit 7"})
         self.assertEqual(response.status_code, 200)
         self.assertEqual(self.db_rows("SELECT delivery_status,lifecycle_status FROM alerts WHERE incident_id=?", ("INC-assignment",))[0][:], ("received_by_command_centre","responder_assigned"))
 
@@ -557,20 +726,20 @@ class SosWorkflowTests(unittest.TestCase):
     def test_lifecycle_requires_ordered_separate_events(self):
         self.sos('INC-lifecycle')
         for target in ['dispatched','arrived','resolved']:
-            self.assertEqual(self.client.post('/api/incidents/INC-lifecycle/lifecycle',json={'status':target}).status_code,409)
-        self.client.post('/api/incidents/INC-lifecycle/assign',json={'responder':'Unit 3'})
+            self.assertEqual(self.operator_client.post('/api/incidents/INC-lifecycle/lifecycle',json={'status':target}).status_code,409)
+        self.operator_client.post('/api/incidents/INC-lifecycle/assign',json={'responder':'Unit 3'})
         for target in ['dispatched','arrived','resolved']:
             if target=='arrived':
                 # Reassignment changes the unit but must not rewind lifecycle.
-                self.client.post('/api/incidents/INC-lifecycle/assign',json={'responder':'Unit 4'})
+                self.operator_client.post('/api/incidents/INC-lifecycle/assign',json={'responder':'Unit 4'})
                 self.assertEqual(self.db_rows("SELECT lifecycle_status FROM alerts WHERE incident_id='INC-lifecycle'")[0][0],'dispatched')
-            response=self.client.post('/api/incidents/INC-lifecycle/lifecycle',json={'status':target})
+            response=self.operator_client.post('/api/incidents/INC-lifecycle/lifecycle',json={'status':target})
             self.assertEqual(response.status_code,200)
         self.assertEqual(self.db_rows("SELECT lifecycle_status FROM alerts WHERE incident_id='INC-lifecycle'")[0][0],'resolved')
 
     def test_dashboard_api_reflects_persisted_receipt_and_history(self):
         self.sos('INC-dashboard')
-        response=self.client.get('/api/incidents')
+        response=self.operator_client.get('/api/incidents')
         self.assertEqual(response.status_code,200)
         incident=next(x for x in response.get_json() if x['incident_id']=='INC-dashboard')
         self.assertEqual(incident['delivery_status'],'received_by_command_centre')

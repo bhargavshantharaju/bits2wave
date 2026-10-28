@@ -14,18 +14,25 @@ The hardware-independent failover controller and host-side fallback SOS store ar
 
 This is not physical ESP32-S3/Pi failover. The SQLite fallback store is a host simulation, the radio remains unconfigured, and no physical timing measurement satisfies the DPR's under-90-second criterion. See [docs/failover-design.md](docs/failover-design.md) for transitions, API, safety limits, recovery policy, and the required bench verification sequence.
 
-### Windows PowerShell setup
+### Development setup and verification
 
-Use Python 3.9–3.11 as declared in `requirements.txt`, from the project directory:
+NexAlert requires Python 3.10 or newer. The code uses PEP 604 union type syntax, which Python 3.9 cannot parse. From a fresh clone:
 
 ```powershell
-py -3.11 -m venv .venv
+py -3.10 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
-python -m unittest discover -s tests -v
-python scripts/e2e_http_smoke.py
+python scripts/verify.py
+```
+
+On Linux or macOS, use Python 3.10 or newer with `python3.10 -m venv .venv` and `source .venv/bin/activate`. `scripts/verify.py` checks Python syntax, runs all unit and integration tests, then runs the localhost HTTP smoke test. The smoke test creates temporary sender, receiver and fallback databases and removes them on exit; it does not need `database/nexalert.db`, dated backups, ignored environment files or pre-existing state. The HTTP smoke test requires a loopback socket and the declared dependencies. To launch the app for development after verification:
+
+```powershell
+$env:NEXALERT_ENV = "development"
 python backend\app.py
 ```
+
+On Linux/macOS, use `NEXALERT_ENV=development python backend/app.py`.
 
 PowerShell database configuration uses distinct files:
 
@@ -34,27 +41,25 @@ $env:NEXALERT_DB = "database\nexalert.db"
 $env:NEXALERT_CC_DB = "database\command-centre.db"
 ```
 
-### WSL setup
+Open `http://localhost:5000/` for the citizen interface and `http://localhost:5000/dashboard` for the command-centre view. Database defaults are `database/nexalert.db` (sender/app) and `database/command-centre.db` (simulated receiver). Set `NEXALERT_DB` and `NEXALERT_CC_DB` before launch to select separate paths; keep those paths distinct.
 
-Use the pinned versions in `requirements.txt` without changing them. Python 3.9–3.11 is the declared compatibility range; this workspace currently has Python 3.12.3, which is outside that declared range.
+### Security setup and limits
 
-```bash
-cd /home/venom/NexAlert-main-phase1
-sudo apt update && sudo apt install python3.12-venv
-python3 -m venv .venv  # create/reuse the project-local environment
-source .venv/bin/activate
-python -m ensurepip --upgrade  # repairs this workspace's existing --without-pip venv
-python -m pip install -r requirements.txt
-python -m unittest discover -s tests -v
-python scripts/e2e_http_smoke.py
-python backend/app.py
+Public onboarding creates a random, temporary pseudonymous citizen identity and an authenticated browser session. A display name is never an account credential. Clearing browser cookies or losing the device session loses access to that identity; registering again creates a different identity, and the server does not recover it from a name. Citizens can submit SOS reports and access only their own incidents and private messages. Operators are created explicitly by an administrator; public registration cannot select a role.
+
+Provision an operator on the host that will run NexAlert (use the same database path and deployment secret as the application):
+
+```sh
+export NEXALERT_ENV=production
+export NEXALERT_SECRET="$(python -c 'import secrets; print(secrets.token_urlsafe(48))')"
+python -m backend.manage_operator --username dispatcher
 ```
 
-Open `http://localhost:5000/` for the citizen interface and `http://localhost:5000/dashboard` for the command-centre view. Database defaults are `database/nexalert.db` (sender/app) and `database/command-centre.db` (simulated receiver). Set `NEXALERT_DB` and `NEXALERT_CC_DB` before launch to select separate paths; keep those paths distinct. The dashboard has no operator authentication and must stay on a trusted local network.
+The command prompts twice for a password (at least 12 characters) and stores only a password hash. Keep the generated secret in a protected service environment or secret manager; do not commit it. Deployment startup refuses a missing or short `NEXALERT_SECRET`. Operator login requires HTTPS in deployment mode. For a TLS reverse proxy, set `NEXALERT_HTTPS=1`; set `NEXALERT_TRUST_PROXY=1` only when the application is reachable solely through a trusted proxy that overwrites forwarded-protocol headers. Set secure database paths using `NEXALERT_DB`, `NEXALERT_CC_DB`, and `NEXALERT_FALLBACK_DB` as needed.
 
-The project verification environment is `.venv-phase1-verify` (Python 3.12.3); the declared deployment compatibility range remains Python 3.9–3.11. Tests and the localhost smoke runner are executed from normal WSL because the restricted Codex sandbox cannot create sockets or temporary files.
+For local development only, launch with `NEXALERT_ENV=development python backend/app.py`. Development generates an ephemeral session secret if none is configured and permits operator login over HTTP; existing sessions become invalid after restart. Do not expose this mode to shared or untrusted networks. HTTP does not encrypt passwords, cookies, CSRF tokens, emergency reports, locations or messages and cannot prevent local-network interception or modification. Authentication and access controls do not provide transport confidentiality. Private messages are not end-to-end encrypted. Session revocation uses a database-backed version checked on protected requests and socket events; logout also disconnects sockets known to the current process. This prototype is not represented as production-secure.
 
-For WSL network diagnosis, check Linux `getent hosts pypi.org`, `curl -I --connect-timeout 10 https://pypi.org/simple/flask/`, `cat /etc/resolv.conf`, and `cat /etc/wsl.conf`; from Windows PowerShell check `wsl --version`, `wsl --status`, `Resolve-DnsName pypi.org`, `Get-DnsClientServerAddress`, `curl.exe -I --connect-timeout 10 https://pypi.org/simple/flask/`, and `$HOME\.wslconfig`. Do not hard-code a resolver or replace WSL-managed `/etc/resolv.conf`. Microsoft documents DNS tunneling for Windows 11 22H2+ and recommends it for DNS problems involving VPNs or firewall policy; `.wslconfig` is global and changes require restarting WSL. Only set `dnsTunneling=true` after checking Windows/WSL support and confirming the setting is disabled; use `autoProxy=true` only if Windows actually uses an HTTP proxy. In this execution environment DNS lookups fail, `curl` cannot resolve either PyPI or Ubuntu archive hosts, and the network namespace exposes no default route. WSL process interop was denied, so the Windows host resolver and full WSL package version could not be queried here; no machine-wide or resolver configuration was changed.
+`docs/security-baseline.md` documents route access, socket audiences, historical data handling, and remaining limitations.
 
 ### Current software architecture and demo
 
@@ -66,11 +71,11 @@ For WSL network diagnosis, check Linux `getent hosts pypi.org`, `curl -I --conne
 
 To reproduce the simulated workflow after dependencies are installed: launch the app with `NEXALERT_ENV=development NEXALERT_ENABLE_SIM_CONTROLS=1`; disconnect with `curl -X POST localhost:5000/api/transport/simulated -H 'Content-Type: application/json' -d '{"connected":false}'`; submit a citizen SOS; stop and restart Flask; confirm transport remains disconnected and the report remains queued; reconnect with `{"connected":true}`; confirm the incident appears on `/dashboard` as received; then assign a responder and separately use Dispatch, Mark arrived, and Resolve. To demonstrate a lost receipt, first set `{"lose_next_ack":true}`, submit SOS, observe it remains queued despite receiver persistence, then retry/reconnect and observe the same incident receives its stored receipt. Direct simulated delivery has no relay hop, so it never claims `relayed`; that state is reserved for a future transport that returns a real relay receipt. `{"fail_next_transmission":true}` demonstrates a failed send retained for retry.
 
-For an automated localhost HTTP run of startup, restart persistence, lost-ack retry, receipt deduplication, operator lifecycle, and database isolation, run `python scripts/e2e_http_smoke.py`. It selects a temporary port and temporary sender/receiver databases, and verifies the production database hash is unchanged.
+For just the HTTP portion of verification, run `python scripts/e2e_http_smoke.py`. It selects a temporary port and temporary sender, receiver and fallback databases. It also confirms the production database remains unchanged when that file happens to exist locally.
 
 ### Verification and capability boundary
 
-**Implemented in source:** optional SOS coordinates/landmark, stable incident and idempotency key, browser retry storage, SQLite sender queue, separate simulated receiver/receipt, follow-up details, restored four-tab citizen UI, local dashboard broadcasts, persisted status summaries, session-bound WebRTC signalling, status history and operator transitions. The local WebSocket client implements only the Engine.IO v4 / Socket.IO event subset used by this app; API reads remain HTTP-based. **Verification (2026-10-28):** the suite contains 38 tests; the final rerun and HTTP smoke run are recorded with the current UI restoration changes. Browser/device layout, actual microphone permission/media, offline tile coverage, and service-worker behavior with the browser fully offline still require browser validation. The reference screenshot directory was absent from this checkout, so pixel-level comparison could not be done. The project database and dated backups must remain protected; tests use temporary SQLite files.
+**Implemented in source:** optional SOS coordinates/landmark, stable incident and idempotency key, browser retry storage, SQLite sender queue, separate simulated receiver/receipt, follow-up details, restored four-tab citizen UI, local dashboard broadcasts, persisted status summaries, session-bound WebRTC signalling, status history and operator transitions. The local WebSocket client implements only the Engine.IO v4 / Socket.IO event subset used by this app; API reads remain HTTP-based. Run `python scripts/verify.py` for the current test count and HTTP smoke verification. Browser/device layout, actual microphone permission/media, offline tile coverage, and service-worker behavior with the browser fully offline still require browser validation. The reference screenshot directory was absent from this checkout, so pixel-level comparison could not be done. The project database and dated backups must remain protected; tests use temporary SQLite files.
 
 **Simulated only:** disconnect/reconnect, direct simulated delivery, failed send, lost acknowledgement, receiver persistence and receipt. The direct simulator has no relay hop. No physical LoRa, real mesh/failover, actual captive-portal behavior on hardware, government alert integration, 48-hour battery life or 100-client capacity is implemented or claimed. Phase 2 begins at the `SosTransport` boundary: replace/add a real transport adapter with radio framing, addressing/routing, retry/ACK semantics, hardware gateway integration and field validation while retaining the incident IDs, durable queue, receiver commit-before-receipt contract and dashboard/API lifecycle.
 
@@ -155,7 +160,7 @@ The proposed rule-based triage categories are **Critical, High, Moderate and Rou
 
 The longer-term concept includes the following capabilities. These are design goals, not all part of the first proof of concept.
 
-- **Temporary pseudonymous identities:** no mandatory name, phone number, email address or OTP. Identity persists across reconnects while the citizen retains their credentials. Identity recovery is not planned; a lost identity requires creating a new one.
+- **Temporary pseudonymous identities:** no mandatory name, phone number, email address or OTP. Identity persists across reconnects while the citizen retains the browser session. Identity recovery is not planned; a lost identity requires creating a new one.
 - **Nearby-user discovery:** users are discoverable by default, with opt-out. A connection request requires recipient consent. Presence is partial during network partitions and must not reveal precise location by default.
 - **Family messaging:** text-only in the core concept, with end-to-end encryption, stable message IDs, acknowledgements and store-and-forward. The planned maximum queue retention for ordinary undelivered messages is 72 hours; emergency incident retention is a separate policy.
 - **Rescue clarification:** authorised operators can send structured questions linked to an incident. Predefined choices are intended for compact LoRa messages; optional short free-text replies use Wi-Fi/IP when available.

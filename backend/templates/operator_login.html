@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>NexAlert · Operator sign in</title></head>
+<body>
+  <main>
+    <h1>NexAlert command centre</h1>
+    <p>Operator access is restricted to accounts provisioned by the system administrator.</p>
+    <form id="login-form">
+      <label>Username <input name="username" autocomplete="username" required></label>
+      <label>Password <input name="password" type="password" autocomplete="current-password" required></label>
+      <button type="submit">Sign in</button>
+    </form>
+    <p id="login-status" role="status"></p>
+  </main>
+  <script>
+    let csrfToken="";
+    fetch("/api/csrf",{cache:"no-store"}).then(r=>r.json()).then(d=>{csrfToken=d.csrf_token;});
+    document.getElementById("login-form").addEventListener("submit",async event=>{
+      event.preventDefault();const form=new FormData(event.currentTarget);
+      const response=await fetch("/api/operator/login",{method:"POST",headers:{"Content-Type":"application/json","X-CSRF-Token":csrfToken},body:JSON.stringify({username:form.get("username"),password:form.get("password")})});
+      const result=await response.json();if(response.ok){location.assign("/dashboard");return;}
+      document.getElementById("login-status").textContent=result.error||"Sign in failed";
+    });
+  </script>
+</body>
+</html>

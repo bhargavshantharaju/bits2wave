@@ -51,3 +51,46 @@ def migrate_sos_schema(conn: sqlite3.Connection, new_incident_id: Callable[[], s
     except Exception:
         conn.rollback()
         raise
+
+
+def migrate_security_schema(conn: sqlite3.Connection) -> None:
+    """Add server-side authentication state without changing incident ownership.
+
+    Existing user roles are untrusted because public registration previously
+    controlled them. The one-time marker demotes historical roles; operator
+    accounts are provisioned explicitly after this migration.
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute("CREATE TABLE IF NOT EXISTS security_migrations (name TEXT PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT(datetime('now')))")
+        additions = {
+            "session_version": "INTEGER NOT NULL DEFAULT 0",
+            "password_hash": "TEXT DEFAULT NULL",
+            "auth_failed_attempts": "INTEGER NOT NULL DEFAULT 0",
+            "auth_locked_until": "TEXT DEFAULT NULL",
+        }
+        user_cols = {row[1] for row in conn.execute("PRAGMA table_info(users)")}
+        for name, declaration in additions.items():
+            if name not in user_cols:
+                conn.execute(f"ALTER TABLE users ADD COLUMN {name} {declaration}")
+        announcement_cols = {row[1] for row in conn.execute("PRAGMA table_info(system_announcements)")}
+        if "created_by" not in announcement_cols:
+            conn.execute("ALTER TABLE system_announcements ADD COLUMN created_by INTEGER REFERENCES users(id)")
+        conn.execute("""CREATE TABLE IF NOT EXISTS operator_actions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            actor_id INTEGER NOT NULL REFERENCES users(id),
+            action TEXT NOT NULL,
+            target_incident_id TEXT,
+            from_state TEXT,
+            to_state TEXT,
+            outcome TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT(datetime('now'))
+        )""")
+        migrated = conn.execute("SELECT 1 FROM security_migrations WHERE name='trusted-roles-v1'").fetchone()
+        if not migrated:
+            conn.execute("UPDATE users SET role='citizen'")
+            conn.execute("INSERT INTO security_migrations(name) VALUES('trusted-roles-v1')")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise

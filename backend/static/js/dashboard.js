@@ -1,8 +1,8 @@
 "use strict";
 const $=id=>document.getElementById(id);
 const esc=value=>String(value??"").replace(/[&<>\"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
-const state={incidents:[],selected:null,users:[],zoom:1,socket:null,feed:[]};
-async function api(url,options={}){const response=await fetch(url,{cache:"no-store",...options,headers:{...(options.body?{"Content-Type":"application/json"}:{}),...(options.headers||{})}});let data;try{data=await response.json();}catch(_){data={};}if(!response.ok)throw new Error(data.error||`Request failed (${response.status})`);return data;}
+const state={incidents:[],selected:null,users:[],zoom:1,socket:null,feed:[],csrfToken:null};
+async function api(url,options={}){const method=(options.method||"GET").toUpperCase(),headers={...(options.body?{"Content-Type":"application/json"}:{}),...(options.headers||{})};if(!["GET","HEAD","OPTIONS"].includes(method)){if(!state.csrfToken){const tokenResponse=await fetch("/api/csrf",{cache:"no-store"});state.csrfToken=(await tokenResponse.json()).csrf_token;}headers["X-CSRF-Token"]=state.csrfToken;}const response=await fetch(url,{cache:"no-store",...options,headers});let data;try{data=await response.json();}catch(_){data={};}if(response.status===401||response.status===403){state.csrfToken=null;if(response.status===401)location.assign("/operator/login");}if(!response.ok)throw new Error(data.error||`Request failed (${response.status})`);return data;}
 function feedback(text,kind=""){const el=$("broadcast-state");el.textContent=text;el.classList.remove("success","error");if(kind)el.classList.add(kind);}
 function clock(){ $("clock").textContent=new Date().toLocaleTimeString([], {hour:"2-digit",minute:"2-digit",second:"2-digit"}); }
 async function loadStatus(){try{const d=await api("/api/status");$("app-dot").classList.add("ok");$("app-dot").classList.remove("offline");$("app-status").textContent="APPLICATION ONLINE";$("node-server").textContent="Connected";$("node-radio").textContent=d.radio_verified?"Verified radio":"Not configured";$("node-radio").classList.toggle("degraded",!d.radio_verified);$("transport-status").textContent=d.transport==="simulated"?`SIMULATED LINK · ${d.simulated_transport_connected?"CONNECTED":"DISCONNECTED"}`:"RADIO UNAVAILABLE";loadFailover();}
@@ -37,6 +37,7 @@ function connectSocket(){if(typeof io!=="function")return;state.socket=io({withC
 function setZoom(delta){state.zoom=Math.max(.7,Math.min(2.2,state.zoom+delta));$("map-markers").style.setProperty("--map-scale",state.zoom);$("map-markers").style.transform=`scale(${state.zoom})`;}
 document.addEventListener("DOMContentLoaded",()=>{
   $("send-broadcast").addEventListener("click",()=>broadcast($("broadcast-msg").value));
+  $("operator-logout").addEventListener("click",async()=>{try{await api("/api/logout",{method:"POST",body:"{}"});}catch(_){}location.assign("/operator/login");});
   document.querySelectorAll(".quick-alerts [data-category]").forEach(button=>button.addEventListener("click",()=>broadcast(button.dataset.category.replaceAll("_"," ").toUpperCase(),button.dataset.category)));
   $("zoom-in").addEventListener("click",()=>setZoom(.15));$("zoom-out").addEventListener("click",()=>setZoom(-.15));$("zoom-reset").addEventListener("click",()=>{state.zoom=1;$("map-markers").style.transform="scale(1)";});
   clock();setInterval(clock,1000);connectSocket();loadStatus();loadIncidents();loadUsers();loadSummary();loadAnnouncements();

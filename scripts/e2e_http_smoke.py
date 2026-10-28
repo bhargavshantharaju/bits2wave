@@ -1,8 +1,8 @@
 """Run Phase 1 SOS over real localhost HTTP using disposable SQLite files.
 
-Usage: .venv/bin/python scripts/e2e_http_smoke.py
-The script starts/stops the existing Flask application and never points it at
-the project database. It requires the pinned Flask dependencies to be present.
+Usage: python scripts/e2e_http_smoke.py
+The script starts/stops Flask with disposable sender, receiver and fallback
+databases. It never requires a project database to exist.
 """
 
 import hashlib
@@ -15,8 +15,11 @@ import subprocess
 import sys
 import tempfile
 import time
+import secrets
+from http.cookiejar import CookieJar
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import Request, urlopen, build_opener, HTTPCookieProcessor
+from werkzeug.security import generate_password_hash
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -30,20 +33,30 @@ def sha256(path):
 class HttpDemo:
     def __init__(self, base_url):
         self.base = base_url
+        self.opener = build_opener(HTTPCookieProcessor(CookieJar()))
+        self.csrf_token = None
 
     def request(self, method, path, body=None, headers=None):
+        headers = dict(headers or {})
+        if method.upper() not in {"GET", "HEAD", "OPTIONS"}:
+            if self.csrf_token is None and path != "/api/csrf":
+                self.request("GET", "/api/csrf")
+            if self.csrf_token:
+                headers.setdefault("X-CSRF-Token", self.csrf_token)
         data = None if body is None else json.dumps(body).encode()
-        request = Request(self.base + path, data=data, method=method, headers=headers or {})
+        request = Request(self.base + path, data=data, method=method, headers=headers)
         if body is not None:
             request.add_header("Content-Type", "application/json")
         try:
-            with urlopen(request, timeout=4) as response:
+            with self.opener.open(request, timeout=4) as response:
                 content = response.read()
                 if not content:
                     parsed=None
                 else:
                     try: parsed=json.loads(content)
                     except (UnicodeDecodeError,ValueError): parsed=content.decode(errors="replace")
+                if isinstance(parsed,dict) and parsed.get("csrf_token"):
+                    self.csrf_token=parsed["csrf_token"]
                 return response.status, parsed
         except HTTPError as error:
             content = error.read()
@@ -51,6 +64,8 @@ class HttpDemo:
                 parsed = json.loads(content) if content else None
             except ValueError:
                 parsed = content.decode(errors="replace")
+            if isinstance(parsed,dict) and parsed.get("csrf_token"):
+                self.csrf_token=parsed["csrf_token"]
             return error.code, parsed
 
 
@@ -60,26 +75,49 @@ def check(condition, message):
 
 
 def main():
-    original_hash = sha256(PRODUCTION_DB)
+    try:
+        import flask  # noqa: F401
+        import flask_socketio  # noqa: F401
+    except ImportError as error:
+        raise SystemExit(
+            "HTTP smoke test needs the declared Flask dependencies. "
+            "Install them with `python -m pip install -r requirements.txt`. "
+            f"Missing import: {error}"
+        ) from error
+
+    production_existed = PRODUCTION_DB.is_file()
+    original_hash = sha256(PRODUCTION_DB) if production_existed else None
     with tempfile.TemporaryDirectory(prefix="nexalert-http-e2e-") as tmp:
         sender_db = Path(tmp) / "sender.sqlite"
         receiver_db = Path(tmp) / "receiver.sqlite"
         app_log = Path(tmp) / "app.log"
-        with socket.socket() as probe:
-            probe.bind(("127.0.0.1", 0))
-            port = probe.getsockname()[1]
+        try:
+            with socket.socket() as probe:
+                probe.bind(("127.0.0.1", 0))
+                port = probe.getsockname()[1]
+        except OSError as error:
+            if isinstance(error, PermissionError):
+                raise SystemExit(
+                    "HTTP smoke test needs permission to bind a loopback socket; "
+                    "run it outside a sandbox that blocks localhost networking."
+                ) from error
+            raise
         env = os.environ.copy()
         env.update({
             "NEXALERT_DB": str(sender_db),
             "NEXALERT_CC_DB": str(receiver_db),
+            "NEXALERT_FALLBACK_DB": str(Path(tmp) / "fallback.sqlite"),
+            "NEXALERT_LOG_DIR": str(Path(tmp) / "logs"),
             "NEXALERT_ENV": "development",
             "NEXALERT_ENABLE_SIM_CONTROLS": "1",
             "NEXALERT_HOST": "127.0.0.1",
             "NEXALERT_PORT": str(port),
-            "NEXALERT_SECRET": "phase1-test-only",
+            "NEXALERT_SECRET": secrets.token_urlsafe(48),
         })
         base = f"http://127.0.0.1:{port}"
         client = HttpDemo(base)
+        anonymous = HttpDemo(base)
+        operator = HttpDemo(base)
         log_handle = open(app_log, "w", encoding="utf-8")
         process = None
 
@@ -115,12 +153,25 @@ def main():
 
         try:
             start()
-            for path in ("/", "/dashboard"):
+            for path in ("/", "/operator/login", "/dashboard"):
                 status, _ = client.request("GET", path)
                 check(status == 200, f"HTTP smoke {path}: expected 200, got {status}")
-            print("PASS: app startup, /health, citizen page, dashboard page")
+            check(anonymous.request("GET","/api/incidents")[0]==401,"anonymous incident access")
+            check(anonymous.request("GET","/api/users")[0]==401,"anonymous user-list access")
+            status, citizen = client.request("POST","/api/register",{"display_name":"Smoke citizen"})
+            check(status==201 and citizen["user"]["role"]=="citizen","pseudonymous citizen onboarding")
+            operator_password=secrets.token_urlsafe(24)
+            sender=sqlite3.connect(sender_db)
+            sender.execute("INSERT INTO users(username,full_name,phone,role,password_hash) VALUES(?,?,'','operator',?)",
+                           ("smoke-operator","Smoke Operator",generate_password_hash(operator_password,method="scrypt")))
+            sender.commit();sender.close()
+            status, login = operator.request("POST","/api/operator/login",{"username":"smoke-operator","password":operator_password})
+            check(status==200 and login["user"]["role"]=="operator","operator login")
+            check(operator.request("GET","/api/users")[0]==200,"operator user-list access")
+            check(client.request("GET","/api/users")[0]==403,"citizen user-list restriction")
+            print("PASS: public onboarding, private routes and operator-only dashboard access")
 
-            status, control = client.request("POST", "/api/transport/simulated", {"connected": False})
+            status, control = operator.request("POST", "/api/transport/simulated", {"connected": False})
             check(status == 200 and control["connected"] is False, "simulated disconnect")
             first_id = "INC-E2E-" + str(int(time.time()))
             first_payload = {"incident_id": first_id, "alert_type": "medical", "description": "E2E queued report"}
@@ -142,7 +193,7 @@ def main():
             check(queued == (first_id, "queued"), "sender queue did not survive process restart")
             print("PASS: restart recovered disconnected state and durable queue")
 
-            status, control = client.request("POST", "/api/transport/simulated", {"connected": True})
+            status, control = operator.request("POST", "/api/transport/simulated", {"connected": True})
             check(status == 200 and control["connected"] is True, "simulated reconnect")
             status, incidents = client.request("GET", "/api/incidents")
             check(status == 200 and {first_id, second_id}.issubset({i["incident_id"] for i in incidents}), "dashboard incident API after reconnect")
@@ -154,7 +205,7 @@ def main():
             print("PASS: reconnect committed receiver records and receipts; dashboard API reflects delivery")
 
             lost_id = "INC-E2E-ACK-" + str(int(time.time()))
-            status, _ = client.request("POST", "/api/transport/simulated", {"lose_next_ack": True})
+            status, _ = operator.request("POST", "/api/transport/simulated", {"lose_next_ack": True})
             check(status == 200, "configure lost acknowledgement")
             lost_payload = {"incident_id": lost_id, "alert_type": "flood", "description": "Lost ACK retry"}
             status, lost = client.request("POST", "/api/sos", lost_payload, {"Idempotency-Key": lost_id})
@@ -163,8 +214,8 @@ def main():
             committed_receipt = destination.execute("SELECT receipt_id FROM command_centre_receipts WHERE incident_id=?", (lost_id,)).fetchone()
             destination.close()
             check(committed_receipt is not None, "receiver must persist before simulated lost ACK")
-            client.request("POST", "/api/transport/simulated", {"connected": False})
-            client.request("POST", "/api/transport/simulated", {"connected": True})
+            operator.request("POST", "/api/transport/simulated", {"connected": False})
+            operator.request("POST", "/api/transport/simulated", {"connected": True})
             status, duplicate = client.request("POST", "/api/sos", lost_payload, {"Idempotency-Key": lost_id})
             check(status == 200 and duplicate["alert"]["receipt_id"] == committed_receipt[0], "retry should return original receipt")
             destination = sqlite3.connect(receiver_db)
@@ -173,10 +224,10 @@ def main():
             print("PASS: lost ACK remained queued, retry returned original durable receipt, no duplicate")
 
             for incident_id in (first_id,):
-                status, assigned = client.request("POST", f"/api/incidents/{incident_id}/assign", {"responder": "E2E Unit"})
+                status, assigned = operator.request("POST", f"/api/incidents/{incident_id}/assign", {"responder": "E2E Unit"})
                 check(status == 200 and assigned["lifecycle_status"] == "responder_assigned", "responder assignment")
                 for event in ("dispatched", "arrived", "resolved"):
-                    status, result = client.request("POST", f"/api/incidents/{incident_id}/lifecycle", {"status": event})
+                    status, result = operator.request("POST", f"/api/incidents/{incident_id}/lifecycle", {"status": event})
                     check(status == 200 and result["lifecycle_status"] == event, f"lifecycle {event}")
             status, detail = client.request("GET", f"/api/incidents/{first_id}")
             check(status == 200 and detail["incident"]["lifecycle_status"] == "resolved", "final dashboard state")
@@ -188,8 +239,14 @@ def main():
             destination = sqlite3.connect(receiver_db)
             check(destination.execute("PRAGMA integrity_check").fetchone()[0] == "ok", "receiver integrity")
             destination.close()
-            check(sha256(PRODUCTION_DB) == original_hash, "production database changed during E2E script")
-            print("PASS: temporary DB integrity checks; production DB hash unchanged")
+            check(PRODUCTION_DB.is_file() == production_existed,
+                  "smoke test changed whether the production database exists")
+            if production_existed:
+                check(sha256(PRODUCTION_DB) == original_hash,
+                      "production database changed during E2E script")
+                print("PASS: temporary DB integrity checks; production DB hash unchanged")
+            else:
+                print("PASS: temporary DB integrity checks; production DB remained absent")
         finally:
             stop()
             log_handle.close()

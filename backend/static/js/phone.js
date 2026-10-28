@@ -2,7 +2,7 @@
 
 const $ = id => document.getElementById(id);
 const state = {
-  username: null, userId: null, role: "civilian", lat: null, lon: null,
+  username: null, userId: null, role: "citizen", csrfToken: null, lat: null, lon: null,
   sosIncidentId: localStorage.getItem("nexalert.pendingIncidentId"),
   selectedSosType: null, lastIncidentId: null, sosSubmitting: false,
   allUsers: [], socket: null, messageIds: new Set(), messageLoaded: false,
@@ -13,6 +13,18 @@ const state = {
 function safeText(value) { return String(value ?? "").replace(/[&<>\"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
 function newId(prefix="") { return prefix + (crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`); }
 function statusMessage(el, text, kind="") { el.textContent=text; el.classList.remove("success","error"); if(kind) el.classList.add(kind); }
+async function apiFetch(url,options={}) {
+  const method=(options.method||"GET").toUpperCase();const headers={...(options.headers||{})};
+  if(!["GET","HEAD","OPTIONS"].includes(method)){
+    if(!state.csrfToken){const tokenResponse=await fetch("/api/csrf",{cache:"no-store"});state.csrfToken=(await tokenResponse.json()).csrf_token;}
+    headers["X-CSRF-Token"]=state.csrfToken;
+  }
+  if(options.body&&!headers["Content-Type"])headers["Content-Type"]="application/json";
+  const response=await fetch(url,{...options,headers});
+  if([401,403].includes(response.status))state.csrfToken=null;
+  if(response.status===401){state.username=null;state.userId=null;state.role="citizen";}
+  return response;
+}
 function setServerStatus(connected) {
   state.online=connected;
   [$("server-dot"),$("app-server-dot")].forEach(dot=>dot.classList.toggle("ok",connected));
@@ -32,21 +44,21 @@ function showScreen(id) { document.querySelectorAll(".screen").forEach(x=>x.clas
 async function register(event) {
   event?.preventDefault();
   const error=$("reg-error"); error.textContent="";
-  let username=localStorage.getItem("nexalert.username");
-  if(!username){username=`citizen-${newId().slice(0,18)}`;localStorage.setItem("nexalert.username",username);}
-  const role=$("reg-role").value;
   try {
-    const response=await fetch("/api/register",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({username,full_name:$("reg-name").value.trim(),role})});
+    const response=await apiFetch("/api/register",{method:"POST",body:JSON.stringify({display_name:$("reg-name").value.trim()})});
     const data=await response.json();
     if(!response.ok||!data.user) throw new Error(data.error||"Could not join the network. You can still use emergency tools.");
-    state.username=data.user.username;state.userId=data.user.id;state.role=data.user.role||role;
-    localStorage.setItem("nexalert.username",state.username);
+    state.username=data.user.username;state.userId=data.user.id;state.role=data.user.role;state.csrfToken=data.csrf_token;
     enterApp(data.user.full_name&&data.user.full_name!=="Anonymous"?data.user.full_name:state.username,true);
   } catch(e) { error.textContent=`${e.message} Use “Continue to emergency tools” to submit an anonymous SOS.`; }
 }
-function continueAsGuest() { state.username=null;state.userId=null;state.role="civilian";enterApp("Emergency access",false); }
+function continueAsGuest() { state.username=null;state.userId=null;state.role="citizen";enterApp("Emergency access",false); }
+async function resumeSession(){try{const response=await fetch("/api/session",{cache:"no-store"});if(!response.ok)return;const data=await response.json();state.username=data.user.username;state.userId=data.user.id;state.role=data.user.role;state.csrfToken=data.csrf_token;enterApp(data.user.full_name||data.user.username,true);}catch(_){}}
+async function ensureCitizenSession(){if(state.username)return;const response=await apiFetch("/api/register",{method:"POST",body:JSON.stringify({display_name:"Anonymous"})});const data=await response.json();if(!response.ok)throw new Error(data.error||"Could not create temporary identity");state.username=data.user.username;state.userId=data.user.id;state.role=data.user.role;state.csrfToken=data.csrf_token;$("user-display").textContent=data.user.full_name||data.user.username;$("session-logout").hidden=false;initSocket();loadMessages();loadAnnouncements();}
+async function leaveSession(){try{await apiFetch("/api/logout",{method:"POST",body:"{}"});}finally{state.socket?.disconnect();state.username=null;state.userId=null;state.csrfToken=null;$("session-logout").hidden=true;showScreen("reg-screen");}}
 function enterApp(label,joined) {
   $("user-display").textContent=label;
+  $("session-logout").hidden=!Boolean(state.username);
   showScreen("app-screen");buildSosGrid();checkServer();
   if(joined){initSocket();loadUsers();loadMessages();loadAnnouncements();}
   loadIncidents();
@@ -61,6 +73,7 @@ function initSocket() {
   state.socket.on("disconnect",()=>{ $("chat-state").textContent="Disconnected · messages will send when server returns"; });
   state.socket.on("connect_error",()=>{ $("chat-state").textContent="Live connection unavailable · saved messages remain accessible"; });
   state.socket.on("new_message",appendMessage);
+  state.socket.on("sos_status",data=>{if(data.incident_id===state.lastIncidentId)statusMessage($("sos-status"),`${data.incident_id}: ${data.delivery_status.replaceAll("_"," ")}`,"success");loadIncidents();});
   state.socket.on("system_announcement",addAnnouncementMessage);
   state.socket.on("user_online",({username})=>{updateUserOnlineStatus(username,true);appendSystemNotice(`online-${username}`,`${username} joined the network`);});
   state.socket.on("user_offline",({username})=>{updateUserOnlineStatus(username,false);appendSystemNotice(`offline-${username}`,`${username} left the network`);});
@@ -79,22 +92,7 @@ function switchTab(name) {
   if(name==="call") loadUsers();
 }
 
-async function loadUsers() {
-  try {
-    const r=await fetch("/api/users",{cache:"no-store"});if(!r.ok)throw new Error("User list unavailable");
-    state.allUsers=await r.json();
-    const online=state.allUsers.filter(user=>Boolean(user.is_online)).length;
-    $("online-count").textContent=`${online} online`;
-    const recipient=$("chat-recipient"), old=recipient.value;
-    recipient.innerHTML='<option value="">Network broadcast</option>';
-    state.allUsers.filter(user=>user.username!==state.username).forEach(user=>{const option=document.createElement("option");option.value=user.username;option.textContent=`${user.is_online?"●":"○"} ${user.full_name||user.username}${user.is_online?" · online":""}`;recipient.append(option);});
-    if([...recipient.options].some(o=>o.value===old))recipient.value=old;
-    const calls=$("call-participant"), selected=calls.value;
-    calls.innerHTML='<option value="">Choose an online participant</option>';
-    state.allUsers.filter(user=>user.username!==state.username&&user.is_online).forEach(user=>{const option=document.createElement("option");option.value=user.username;option.textContent=user.full_name||user.username;calls.append(option);});
-    if([...calls.options].some(o=>o.value===selected))calls.value=selected;
-  } catch (_) { $("online-count").textContent="— online"; }
-}
+async function loadUsers() { $("online-count").textContent="Private directory"; }
 function updateUserOnlineStatus(username,online){const user=state.allUsers.find(x=>x.username===username);if(user)user.is_online=online?1:0;loadUsers();}
 
 function appendMessage(msg) {
@@ -120,26 +118,26 @@ function formatTime(value){if(!value)return"time unavailable";const date=new Dat
 async function loadMessages(){
   if(!state.username){$("chat-state").textContent="Join the network to use chat. Emergency SOS is available without joining.";return;}
   $("chat-state").textContent="Loading saved messages…";
-  try{const r=await fetch(`/api/messages?username=${encodeURIComponent(state.username)}`);if(!r.ok)throw new Error("Messages could not be loaded");const rows=await r.json();rows.reverse().forEach(appendMessage);state.messageLoaded=true;$("chat-state").textContent=rows.length?"Saved network messages":"No messages yet";}
+  try{const r=await apiFetch("/api/messages");if(!r.ok)throw new Error("Messages could not be loaded");const rows=await r.json();rows.reverse().forEach(appendMessage);state.messageLoaded=true;$("chat-state").textContent=rows.length?"Your saved messages":"No messages yet";}
   catch(e){$("chat-state").textContent=e.message;}
 }
 async function loadAnnouncements(){try{const r=await fetch("/api/announcements");if(r.ok)(await r.json()).reverse().forEach(addAnnouncementMessage);}catch(_) {}}
-async function sendMessage(event){event?.preventDefault();const input=$("msg-input"),content=input.value.trim();if(!content)return;if(!state.username){$("chat-state").textContent="Join the network before sending messages.";return;}const recipient=$("chat-recipient").value;
-  try{const r=await fetch("/api/messages",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({sender:state.username,recipient:recipient||null,content,is_broadcast:recipient?0:1})});const data=await r.json();if(!r.ok)throw new Error(data.error||"Message was not accepted");appendMessage(data.message);input.value="";$("chat-state").textContent=recipient?`Saved and sent to ${recipient}`:"Saved · local application broadcast";}
+async function sendMessage(event){event?.preventDefault();const input=$("msg-input"),content=input.value.trim();if(!content)return;const recipient=$("chat-recipient").value.trim();if(!recipient){$("chat-state").textContent="Enter the recipient's temporary ID.";return;}
+  try{await ensureCitizenSession();const r=await apiFetch("/api/messages",{method:"POST",body:JSON.stringify({recipient,content})});const data=await r.json();if(!r.ok)throw new Error(data.error||"Message was not accepted");appendMessage(data.message);input.value="";$("chat-state").textContent=`Saved and sent to ${recipient}`;}
   catch(e){$("chat-state").textContent=`Message not sent: ${e.message}`;}}
 
 function buildSosGrid(){const grid=$("sos-grid");grid.replaceChildren();Object.entries(window.NEXALERT_TYPES||{}).forEach(([key,meta])=>{const button=document.createElement("button");button.type="button";button.className="sos-btn";button.dataset.type=key;button.innerHTML=`<span class="sos-icon">${safeText(meta.icon)}</span><small>${safeText(meta.label)}</small>`;button.addEventListener("click",()=>selectSosType(key,button));grid.append(button);});}
 function selectSosType(type,button){document.querySelectorAll(".sos-btn").forEach(b=>b.classList.toggle("selected",b===button));state.selectedSosType=type;if(!state.sosIncidentId){state.sosIncidentId=newId("INC-");localStorage.setItem("nexalert.pendingIncidentId",state.sosIncidentId);}sendSos();}
 async function sendSos(){if(!state.selectedSosType||state.sosSubmitting)return;state.sosSubmitting=true;const status=$("sos-status");statusMessage(status,"Submitting SOS to the application…");
-  const payload={alert_type:state.selectedSosType,description:$("sos-desc").value.trim(),landmark:$("sos-landmark").value.trim(),latitude:state.lat,longitude:state.lon,incident_id:state.sosIncidentId,idempotency_key:state.sosIncidentId};if(state.username)payload.username=state.username;
-  try{const r=await fetch("/api/sos",{method:"POST",headers:{"Content-Type":"application/json","Idempotency-Key":state.sosIncidentId},body:JSON.stringify(payload)});const data=await r.json();if(!r.ok)throw new Error(data.error||"SOS was not accepted");const alert=data.alert;const labels={saved_locally:"saved locally",queued:"queued for delivery",relayed:"relayed",received_by_command_centre:"received by command centre"};const receipt=alert.receipt_id?` · ${safeText(alert.receipt_id)} (simulated receipt)`:"";statusMessage(status,`${alert.incident_id}: ${labels[alert.delivery_status]||alert.delivery_status}${receipt}`,"success");state.lastIncidentId=alert.incident_id;$("sos-followup").hidden=false;state.selectedSosType=null;state.sosIncidentId=null;localStorage.removeItem("nexalert.pendingIncidentId");$("sos-desc").value="";$("sos-landmark").value="";state.lat=state.lon=null;$("location-status").textContent="Location not attached";loadIncidents();}
-  catch(e){const pending=JSON.parse(localStorage.getItem("nexalert.pendingSos")||"{}");pending[state.sosIncidentId]={...payload,username:state.username||undefined};localStorage.setItem("nexalert.pendingSos",JSON.stringify(pending));statusMessage(status,state.online?`SOS not accepted · ${e.message} · retry keeps ${state.sosIncidentId}`:`Server offline · saved on this device only · ${state.sosIncidentId}`,"error");}
+  const payload={alert_type:state.selectedSosType,description:$("sos-desc").value.trim(),landmark:$("sos-landmark").value.trim(),latitude:state.lat,longitude:state.lon,incident_id:state.sosIncidentId,idempotency_key:state.sosIncidentId};
+  try{await ensureCitizenSession();const r=await apiFetch("/api/sos",{method:"POST",headers:{"Idempotency-Key":state.sosIncidentId},body:JSON.stringify(payload)});const data=await r.json();if(!r.ok)throw new Error(data.error||"SOS was not accepted");const alert=data.alert;const labels={saved_locally:"saved locally",queued:"queued for delivery",relayed:"relayed",received_by_command_centre:"received by command centre"};const receipt=alert.receipt_id?` · ${safeText(alert.receipt_id)} (simulated receipt)`:"";statusMessage(status,`${alert.incident_id}: ${labels[alert.delivery_status]||alert.delivery_status}${receipt}`,"success");state.lastIncidentId=alert.incident_id;$("sos-followup").hidden=false;state.selectedSosType=null;state.sosIncidentId=null;localStorage.removeItem("nexalert.pendingIncidentId");$("sos-desc").value="";$("sos-landmark").value="";state.lat=state.lon=null;$("location-status").textContent="Location not attached";loadIncidents();}
+  catch(e){const pending=JSON.parse(localStorage.getItem("nexalert.pendingSos")||"{}");pending[state.sosIncidentId]=payload;localStorage.setItem("nexalert.pendingSos",JSON.stringify(pending));statusMessage(status,state.online?`SOS not accepted · ${e.message} · retry keeps ${state.sosIncidentId}`:`Server offline · saved on this device only · ${state.sosIncidentId}`,"error");}
   finally{state.sosSubmitting=false;}}
 function attachLocation(){if(!navigator.geolocation){$("location-status").textContent="Location unavailable in this browser.";return;}$("location-status").textContent="Requesting one-time location…";navigator.geolocation.getCurrentPosition(p=>{state.lat=p.coords.latitude;state.lon=p.coords.longitude;$("location-status").textContent="Location attached to next SOS only.";},()=>{$("location-status").textContent="Location unavailable; SOS can still be submitted.";},{enableHighAccuracy:false,timeout:10000,maximumAge:60000});}
-async function submitFollowup(){if(!state.lastIncidentId)return;const update={};if($("followup-description").value.trim())update.description=$("followup-description").value.trim();if($("followup-landmark").value.trim())update.landmark=$("followup-landmark").value.trim();if(!Object.keys(update).length){statusMessage($("sos-status"),"Add an optional detail first.");return;}try{const r=await fetch(`/api/incidents/${encodeURIComponent(state.lastIncidentId)}/updates`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(update)});const data=await r.json();if(!r.ok)throw new Error(data.error||"Update not saved");statusMessage($("sos-status"),`Update saved to ${state.lastIncidentId}`,"success");$("followup-description").value="";$("followup-landmark").value="";}catch(e){statusMessage($("sos-status"),e.message,"error");}}
-async function retryPendingSos(){const pending=JSON.parse(localStorage.getItem("nexalert.pendingSos")||"{}");for(const [key,payload] of Object.entries(pending)){try{const r=await fetch("/api/sos",{method:"POST",headers:{"Content-Type":"application/json","Idempotency-Key":key},body:JSON.stringify(payload)});if(!r.ok)continue;delete pending[key];localStorage.setItem("nexalert.pendingSos",JSON.stringify(pending));const data=await r.json();statusMessage($("sos-status"),`${data.alert.incident_id}: ${data.alert.delivery_status.replaceAll("_"," ")}${data.alert.receipt_id?` · ${data.alert.receipt_id} (simulated receipt)`:""}`,"success");}catch(_){break;}}}
+async function submitFollowup(){if(!state.lastIncidentId)return;const update={};if($("followup-description").value.trim())update.description=$("followup-description").value.trim();if($("followup-landmark").value.trim())update.landmark=$("followup-landmark").value.trim();if(!Object.keys(update).length){statusMessage($("sos-status"),"Add an optional detail first.");return;}try{const r=await apiFetch(`/api/incidents/${encodeURIComponent(state.lastIncidentId)}/updates`,{method:"POST",body:JSON.stringify(update)});const data=await r.json();if(!r.ok)throw new Error(data.error||"Update not saved");statusMessage($("sos-status"),`Update saved to ${state.lastIncidentId}`,"success");$("followup-description").value="";$("followup-landmark").value="";}catch(e){statusMessage($("sos-status"),e.message,"error");}}
+async function retryPendingSos(){const pending=JSON.parse(localStorage.getItem("nexalert.pendingSos")||"{}");for(const [key,payload] of Object.entries(pending)){try{await ensureCitizenSession();const r=await apiFetch("/api/sos",{method:"POST",headers:{"Idempotency-Key":key},body:JSON.stringify(payload)});if(!r.ok)continue;delete pending[key];localStorage.setItem("nexalert.pendingSos",JSON.stringify(pending));const data=await r.json();statusMessage($("sos-status"),`${data.alert.incident_id}: ${data.alert.delivery_status.replaceAll("_"," ")}${data.alert.receipt_id?` · ${data.alert.receipt_id} (simulated receipt)`:""}`,"success");}catch(_){break;}}}
 
-async function loadIncidents(){try{const r=await fetch("/api/incidents",{cache:"no-store"});if(!r.ok)throw new Error("Incident list unavailable");renderIncidentData(await r.json());}catch(e){$("citizen-incident-list").innerHTML=`<p class="empty-state">${safeText(e.message)}</p>`;$("citizen-unknown-list").innerHTML="";}}
+async function loadIncidents(){if(!state.username){$("citizen-incident-list").innerHTML='<p class="empty-state">Continue privately to view your SOS status.</p>';return;}try{const r=await apiFetch("/api/incidents",{cache:"no-store"});if(!r.ok)throw new Error("Your incident status is unavailable");renderIncidentData(await r.json());}catch(e){$("citizen-incident-list").innerHTML=`<p class="empty-state">${safeText(e.message)}</p>`;$("citizen-unknown-list").innerHTML="";}}
 function hasCoordinates(x){return Number.isFinite(Number(x.latitude))&&Number.isFinite(Number(x.longitude))&&x.latitude!==null&&x.longitude!==null&&!(Number(x.latitude)===0&&Number(x.longitude)===0);}
 function renderIncidentData(rows){const mapped=rows.filter(hasCoordinates);const unknown=rows.filter(x=>!hasCoordinates(x));const map=$("citizen-map");map.replaceChildren();
   if(mapped.length){const latitudes=mapped.map(x=>Number(x.latitude)),longitudes=mapped.map(x=>Number(x.longitude));const minLat=Math.min(...latitudes),maxLat=Math.max(...latitudes),minLon=Math.min(...longitudes),maxLon=Math.max(...longitudes);mapped.forEach((x,i)=>{const button=document.createElement("button");button.className="plot-marker";button.type="button";button.title=`${x.incident_id} · ${x.latitude}, ${x.longitude}`;const xPct=maxLon===minLon?50:8+(Number(x.longitude)-minLon)/(maxLon-minLon)*84;const yPct=maxLat===minLat?50:8+(maxLat-Number(x.latitude))/(maxLat-minLat)*84;button.style.left=`${xPct}%`;button.style.top=`${yPct}%`;button.innerHTML=`<span>${i+1}</span>`;button.onclick=()=>showIncidentRow(x);map.append(button);});}else map.innerHTML='<p class="empty-state">No reports with coordinates</p>';
@@ -166,8 +164,9 @@ function toggleMute(){if(!state.localStream)return;state.muted=!state.muted;stat
 
 document.addEventListener("DOMContentLoaded",()=>{
   $("join-form").addEventListener("submit",register);$("guest-continue").addEventListener("click",continueAsGuest);
+  $("session-logout").addEventListener("click",leaveSession);
   document.querySelectorAll(".nav-btn").forEach(btn=>btn.addEventListener("click",()=>switchTab(btn.dataset.tab)));
   $("message-form").addEventListener("submit",sendMessage);$("attach-location").addEventListener("click",attachLocation);$("send-followup").addEventListener("click",submitFollowup);
   $("start-call").addEventListener("click",startCall);$("accept-call").addEventListener("click",acceptCall);$("decline-call").addEventListener("click",declineCall);$("hangup-call").addEventListener("click",hangupCall);$("mute-call").addEventListener("click",toggleMute);
-  checkServer();setInterval(checkServer,10000);setInterval(()=>{if(state.username)loadUsers();},20000);window.addEventListener("online",retryPendingSos);
+  checkServer();setInterval(checkServer,10000);window.addEventListener("online",retryPendingSos);resumeSession();
 });

@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#071321">
+  <title>NexAlert · Command Centre</title>
+  <link rel="stylesheet" href="/static/css/dashboard.css">
+</head>
+<body class="dashboard-page">
+  <header class="topbar">
+    <a class="dashboard-brand" href="/"><span class="brand-signal">⌁</span><span>NEX<strong>ALERT</strong><small>EMERGENCY COMMUNICATION NETWORK</small></span></a>
+    <div class="room-title"><span class="eyebrow">NEXALERT</span><strong>COMMAND CENTRE</strong></div>
+    <div class="top-status"><span><i class="status-dot" id="app-dot"></i><b id="app-status">CHECKING SERVER</b></span><span class="transport-chip" id="transport-status">TRANSPORT UNKNOWN</span><time id="clock">--:--:--</time></div>
+  </header>
+
+  <main class="dashboard-layout">
+    <section class="map-column">
+      <div class="map-heading"><div><p class="eyebrow">SITUATIONAL OVERVIEW</p><h1>Incident Map</h1></div><span id="map-count" class="map-count">Loading reports…</span></div>
+      <p id="map-disclaimer" class="map-disclaimer">Pilot-region basemap is not installed. Markers are positioned from reported coordinates only.</p>
+      <div id="command-map" class="command-map" role="img" aria-label="Coordinate view of incident reports">
+        <div class="map-axis axis-top">REPORTED COORDINATES</div>
+        <div id="map-markers" class="map-markers"></div>
+        <div class="map-empty">Awaiting incident data…</div>
+        <div class="map-controls"><button id="zoom-in" aria-label="Zoom in" type="button">＋</button><button id="zoom-out" aria-label="Zoom out" type="button">−</button><button id="zoom-reset" type="button">RESET</button></div>
+        <div class="map-legend"><span><i class="legend-dot active-dot"></i>Received incident</span><span><i class="legend-dot unknown-dot"></i>Unknown location in list</span></div>
+      </div>
+      <div class="coordinate-footer"><span id="coordinate-range">No coordinate range</span><span>NO OFFLINE BASEMAP DATA</span></div>
+      <section class="selected-incident"><div class="selected-title"><h2>Incident details</h2><span id="selected-status" class="status-label">SELECT A MARKER</span></div><div id="incident-detail" class="incident-detail"><p>Select an incident marker or report to inspect its persisted status and history.</p></div></section>
+    </section>
+
+    <aside class="control-panel">
+      <div class="panel-section online-section"><div class="section-title"><h2>Network users</h2><span class="count-pill"><b id="online-count">—</b> ONLINE</span></div><div id="users-list" class="users-list"><p class="empty-state">Loading participant list…</p></div></div>
+
+      <div class="panel-section incident-section"><div class="section-title"><h2>Incoming SOS</h2><span id="incident-count" class="subtle-count">0</span></div><div id="alerts-list" class="alerts-list"><p class="empty-state">Loading incidents…</p></div></div>
+
+      <div class="panel-section command-section"><div class="section-title"><h2>Command &amp; broadcast</h2><span class="local-tag">LOCAL APP</span></div><label class="sr-only" for="broadcast-msg">Message to all connected clients</label><textarea id="broadcast-msg" rows="3" maxlength="500" placeholder="Compose an announcement…"></textarea><button id="send-broadcast" class="send-broadcast" type="button">SEND TO ALL <span>→</span></button><p id="broadcast-state" class="feedback" role="status" aria-live="polite">Broadcasts are stored locally and do not confirm radio delivery.</p>
+        <div class="quick-alerts"><h3>QUICK ALERTS</h3><button data-category="cyclone_warning" type="button">CYCLONE WARNING</button><button data-category="flood_alert" type="button">FLOOD ALERT</button><button data-category="all_clear" type="button">ALL CLEAR</button><button data-category="rescue_en_route" type="button">RESCUE EN ROUTE</button></div>
+      </div>
+
+      <div class="panel-section feed-section"><div class="section-title"><h2>Live activity</h2><span class="live-mark"><i class="status-dot ok"></i> LIVE</span></div><div id="activity-feed" class="activity-feed"><p class="empty-state">Waiting for system events…</p></div></div>
+      <div class="panel-section node-section"><div class="section-title"><h2>Node &amp; system</h2></div><div class="node-state"><span>Application server</span><b id="node-server">Checking…</b><span>Radio hardware</span><b id="node-radio">Not configured</b><span>Node role</span><b id="node-role">Checking…</b><span>Failover state</span><b id="failover-state">Checking…</b><span>Master heartbeat</span><b id="master-heartbeat">Unknown</b><span>Failover elapsed</span><b id="failover-elapsed">—</b><span>Fallback reports pending</span><b id="fallback-pending">0</b><span>Fallback reports accepted</span><b id="fallback-received">0</b><span>Recovery status</span><b id="failover-reason">—</b></div></div>
+    </aside>
+  </main>
+
+  <footer class="summary-bar"><div><b id="stat-users">—</b><small>ONLINE PARTICIPANTS</small></div><div><b id="stat-messages">—</b><small>MESSAGES</small></div><div><b id="stat-alerts">—</b><small>SOS TODAY</small></div><div><b id="stat-uptime">—</b><small>APPLICATION UPTIME</small></div></footer>
+  <script>window.ALERT_TYPES={{ alert_types|tojson }};</script>
+  <script src="/static/js/socket-client.js"></script>
+  <script src="/static/js/dashboard.js"></script>
+</body>
+</html>

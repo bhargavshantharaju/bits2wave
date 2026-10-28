@@ -1,0 +1,618 @@
+"""Integration tests for NexAlert's durable simulated SOS workflow.
+
+These use Flask's test client and temporary SQLite files; no physical transport
+or radio configuration is involved.
+"""
+
+import importlib.util
+import json
+import os
+import sqlite3
+import tempfile
+import unittest
+
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+APP_PATH = os.path.join(ROOT, "backend", "app.py")
+SPEC = importlib.util.spec_from_file_location("nexalert_app", APP_PATH)
+appmod = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(appmod)
+
+
+class AppFakeRadioLink:
+    """In-memory packet link used only by Flask acceptance tests."""
+    def __init__(self):
+        self.connected = True
+        self.peer = None
+        self.on_packet = None
+        self.incoming = []
+        self.sent = []
+        self.drop_packet = None
+
+    def send(self, packet):
+        from backend.radio_transport import RadioTxResult
+        self.sent.append(packet)
+        if not self.connected:
+            raise ConnectionError("fake link disconnected")
+        if self.drop_packet and self.drop_packet(packet):
+            return RadioTxResult(tx_done=True)
+        if self.peer:
+            if self.peer.on_packet:
+                self.peer.on_packet(packet)
+            else:
+                self.peer.incoming.append(packet)
+        return RadioTxResult(tx_done=True)
+
+    def receive(self, timeout_s):
+        return self.incoming.pop(0) if self.incoming else None
+
+
+class SosWorkflowTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.old_db_path = appmod.DB_PATH
+        self.old_cc_path = appmod.CC_DB_PATH
+        self.old_fallback_path = appmod.FALLBACK_DB_PATH
+        self.old_testing = appmod.app.config.get("TESTING", False)
+        appmod.DB_PATH = os.path.join(self.tmp.name, "nexalert.db")
+        appmod.CC_DB_PATH = os.path.join(self.tmp.name, "command-centre.db")
+        appmod.FALLBACK_DB_PATH = os.path.join(self.tmp.name, "fallback.db")
+        appmod.transport = appmod.SimulatedTransport()
+        appmod.ACTIVE_CALLS.clear()
+        appmod.app.config.update(TESTING=True)
+        appmod.init_db()
+        self.client = appmod.app.test_client()
+        self.register("citizen")
+
+    def tearDown(self):
+        appmod.DB_PATH = self.old_db_path
+        appmod.CC_DB_PATH = self.old_cc_path
+        appmod.FALLBACK_DB_PATH = self.old_fallback_path
+        appmod.app.config.update(TESTING=self.old_testing)
+        self.tmp.cleanup()
+
+    def register(self, username):
+        response = self.client.post("/api/register", json={
+            "username": username, "full_name": "Test Citizen", "phone": "+910000000000",
+        })
+        self.assertIn(response.status_code, (200, 201))
+
+    def sos(self, incident_id="INC-test-incident", **extra):
+        payload = {
+            "username": "citizen", "incident_id": incident_id,
+            "alert_type": "medical", "description": "Needs help",
+            "latitude": 12.9, "longitude": 77.5,
+        }
+        payload.update(extra)
+        return self.client.post("/api/sos", json=payload)
+
+    def db_rows(self, sql, params=()):
+        conn = appmod.open_db_connection()
+        try:
+            return conn.execute(sql, params).fetchall()
+        finally:
+            conn.close()
+
+    def install_radio_adapter(self, receipt_drop=None, sender_id=b"APPNODE1", peer_id=b"GATEWAY1"):
+        """Bind the adapter to real app DB callbacks; only the radio link is fake."""
+        from backend.radio_protocol import decode
+        from backend.radio_transport import RadioSosTransport
+
+        sender_link, receiver_link = AppFakeRadioLink(), AppFakeRadioLink()
+        sender_link.peer, receiver_link.peer = receiver_link, sender_link
+        receiver_link.drop_packet = receipt_drop
+
+        def pending_reports():
+            conn = appmod.open_db_connection()
+            try:
+                rows = conn.execute("""
+                    SELECT a.incident_id,a.alert_type,a.description,a.latitude,a.longitude,
+                           a.landmark,a.timestamp
+                    FROM alerts a JOIN outbound_queue q USING(incident_id)
+                    WHERE q.state!='delivered' ORDER BY q.id
+                """).fetchall()
+                return [dict(row) for row in rows]
+            finally:
+                conn.close()
+
+        def record_attempt(report, outcome, detail):
+            conn = appmod.open_db_connection()
+            try:
+                if outcome == "radio_tx_done":
+                    conn.execute("UPDATE outbound_queue SET attempts=attempts+1,last_attempt_at=datetime('now') WHERE incident_id=?",
+                                 (report["incident_id"],))
+                conn.execute("INSERT INTO delivery_attempts(incident_id,outcome,detail) VALUES(?,?,?)",
+                             (report["incident_id"], outcome, str(detail)))
+                conn.commit()
+            finally:
+                conn.close()
+
+        def persist_received(frame):
+            body = json.loads(frame.payload.decode("ascii"))
+            report = {"incident_id": frame.incident_id, "alert_type": body.get("c", "other"),
+                      "description": body.get("d", ""), "latitude": body.get("a"),
+                      "longitude": body.get("o"), "landmark": body.get("l", ""),
+                      "timestamp": body.get("t"), "source_node_id": frame.source.hex(),
+                      "origin_mode": "primary"}
+            conn = sqlite3.connect(appmod.CC_DB_PATH)
+            conn.row_factory = sqlite3.Row
+            try:
+                receipt = appmod.persist_command_centre_incident(conn, report)
+                return receipt
+            finally:
+                conn.close()
+
+        def record_receipt(report, receipt_id):
+            sender = appmod.open_db_connection()
+            receiver = sqlite3.connect(appmod.CC_DB_PATH)
+            try:
+                if not appmod.record_command_centre_receipt(
+                        sender, receiver, report["incident_id"], receipt_id,
+                        "fake-link integration received durable command-centre receipt"):
+                    raise ValueError("receipt does not match persistent command-centre record")
+            finally:
+                sender.close()
+                receiver.close()
+
+        self.radio_receiver = RadioSosTransport(
+            receiver_link, peer_id, sender_id, lambda: (), lambda *args: None,
+            lambda *args: None, persist_received, lambda: True,
+            max_attempts=3, ack_timeout_s=0.01, base_backoff_s=0, max_backoff_s=0)
+        receiver_link.on_packet = self.radio_receiver.handle_packet
+        self.radio_sender = RadioSosTransport(
+            sender_link, sender_id, peer_id, pending_reports, record_attempt,
+            record_receipt, lambda frame: "RCP-unexpected", lambda: True,
+            max_attempts=3, ack_timeout_s=0.01, base_backoff_s=0, max_backoff_s=0)
+        appmod.transport = self.radio_sender
+        return sender_link, receiver_link
+
+    def test_radio_adapter_is_not_the_default_application_transport(self):
+        self.assertIsInstance(appmod.transport, appmod.SimulatedTransport)
+        self.assertEqual(appmod.transport.status()["kind"], "simulated")
+        self.assertEqual(self.client.get("/api/status").get_json()["transport"], "simulated")
+
+    def test_sos_route_radio_boundary_persists_receipt_and_operator_lifecycle(self):
+        self.install_radio_adapter()
+        response = self.sos("INC-app-radio-accepted")
+        body = response.get_json()["alert"]
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(body["delivery_status"], "received_by_command_centre")
+        self.assertEqual(body["receipt_id"], "RCP-INC-app-radio-accepted")
+        state = self.client.get("/api/status").get_json()
+        self.assertEqual(state["transport"], "physical_radio_adapter")
+        self.assertFalse(state["radio_verified"])
+        self.assertFalse(state["simulated_transport_connected"])
+        source = self.db_rows("SELECT state,attempts FROM outbound_queue WHERE incident_id=?",
+                              ("INC-app-radio-accepted",))[0]
+        self.assertEqual(tuple(source), ("delivered", 1))
+        receiver = sqlite3.connect(appmod.CC_DB_PATH)
+        self.assertEqual(receiver.execute("SELECT count(*) FROM command_centre_incidents WHERE incident_id=?",
+                                           ("INC-app-radio-accepted",)).fetchone()[0], 1)
+        self.assertEqual(receiver.execute("SELECT receipt_id FROM command_centre_receipts WHERE incident_id=?",
+                                           ("INC-app-radio-accepted",)).fetchone()[0], body["receipt_id"])
+        receiver.close()
+        dashboard = self.client.get("/api/incidents").get_json()
+        incident = next(item for item in dashboard if item["incident_id"] == "INC-app-radio-accepted")
+        self.assertEqual(incident["delivery_status"], "received_by_command_centre")
+        assigned = self.client.post("/api/incidents/INC-app-radio-accepted/assign",
+                                    json={"responder": "Radio Test Unit"})
+        self.assertEqual(assigned.get_json()["lifecycle_status"], "responder_assigned")
+        self.assertEqual(self.db_rows("SELECT delivery_status,lifecycle_status FROM alerts WHERE incident_id=?",
+                                      ("INC-app-radio-accepted",))[0][:],
+                         ("received_by_command_centre", "responder_assigned"))
+        duplicate = self.sos("INC-app-radio-accepted")
+        self.assertEqual(duplicate.status_code, 200)
+        self.assertEqual(duplicate.get_json()["alert"]["lifecycle_status"], "responder_assigned")
+        self.assertEqual(len(self.db_rows("SELECT * FROM incident_events WHERE incident_id=? AND status='received_by_command_centre'",
+                                          ("INC-app-radio-accepted",))), 1)
+
+    def test_tx_and_ack_without_receipt_stays_queued_then_reconnects(self):
+        from backend.radio_protocol import MessageType, decode
+        _, receiver_link = self.install_radio_adapter(
+            receipt_drop=lambda packet: decode(packet).message_type == MessageType.RECEIPT)
+        response = self.sos("INC-app-radio-no-receipt")
+        self.assertEqual(response.get_json()["alert"]["delivery_status"], "queued")
+        self.assertEqual(self.db_rows("SELECT state FROM outbound_queue WHERE incident_id=?",
+                                      ("INC-app-radio-no-receipt",))[0][0], "queued")
+        self.assertEqual(self.db_rows("SELECT delivery_status,receipt_id FROM alerts WHERE incident_id=?",
+                                      ("INC-app-radio-no-receipt",))[0][:], ("queued", None))
+        receiver = sqlite3.connect(appmod.CC_DB_PATH)
+        self.assertEqual(receiver.execute("SELECT count(*) FROM command_centre_incidents WHERE incident_id=?",
+                                           ("INC-app-radio-no-receipt",)).fetchone()[0], 1)
+        receiver.close()
+        receiver_link.drop_packet = None
+        self.assertEqual(appmod.transport.process_queue(), 1)
+        self.assertEqual(self.db_rows("SELECT delivery_status FROM alerts WHERE incident_id=?",
+                                      ("INC-app-radio-no-receipt",))[0][0],
+                         "received_by_command_centre")
+
+    def test_disconnected_or_throwing_radio_keeps_http_sos_recoverable(self):
+        sender_link, _ = self.install_radio_adapter()
+        original_send = sender_link.send
+
+        def fail_send(packet):
+            raise OSError("fake serial disconnection")
+
+        sender_link.send = fail_send
+        response = self.sos("INC-app-radio-disconnect")
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.get_json()["alert"]["delivery_status"], "queued")
+        self.assertEqual(self.db_rows("SELECT state FROM outbound_queue WHERE incident_id=?",
+                                      ("INC-app-radio-disconnect",))[0][0], "queued")
+        self.assertIn("fake serial disconnection", appmod.transport.last_error)
+        sender_link.send = original_send
+        self.assertEqual(appmod.transport.process_queue(), 1)
+        self.assertEqual(self.db_rows("SELECT delivery_status FROM alerts WHERE incident_id=?",
+                                      ("INC-app-radio-disconnect",))[0][0],
+                         "received_by_command_centre")
+
+    def test_radio_sender_restart_retries_original_incident_and_keeps_distinct_reports(self):
+        from backend.radio_protocol import MessageType, decode
+        sender_link, receiver_link = self.install_radio_adapter(
+            receipt_drop=lambda packet: decode(packet).message_type == MessageType.RECEIPT)
+        first = self.sos("INC-radio-restart-first")
+        self.assertEqual(first.get_json()["alert"]["delivery_status"], "queued")
+        original_frames = [packet for packet in sender_link.sent if decode(packet).message_type == MessageType.SOS]
+        self.assertGreaterEqual(len(original_frames), 2)
+        receiver_link.drop_packet = None
+        # Rebuild the sender adapter to emulate process restart; the DB queue is authoritative.
+        self.install_radio_adapter()
+        self.assertEqual(appmod.transport.process_queue(), 1)
+        second = self.sos("INC-radio-restart-second")
+        self.assertEqual(second.get_json()["alert"]["delivery_status"], "received_by_command_centre")
+        self.assertEqual(len(self.db_rows("SELECT * FROM alerts WHERE incident_id IN (?,?)",
+                                           ("INC-radio-restart-first", "INC-radio-restart-second"))), 2)
+        receiver = sqlite3.connect(appmod.CC_DB_PATH)
+        self.assertEqual(receiver.execute("SELECT count(*) FROM command_centre_incidents WHERE incident_id IN (?,?)",
+                                           ("INC-radio-restart-first", "INC-radio-restart-second")).fetchone()[0], 2)
+        receiver.close()
+
+    def test_valid_sos_is_persisted_before_delivery(self):
+        appmod.transport.configure(connected=False)
+        response = self.sos()
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.get_json()["alert"]["delivery_status"], "queued")
+        self.assertEqual(len(self.db_rows("SELECT * FROM alerts")), 1)
+        self.assertEqual(len(self.db_rows("SELECT * FROM outbound_queue")), 1)
+
+    def activate_fallback_api(self):
+        ctl = appmod.failover_controller
+        ctl.monitor.last_received_at -= 30
+        ctl.set_simulation(primary_running=False, drop_heartbeats=True)
+        self.client.get("/api/failover/status")  # timeout -> activating
+        ctl.activation_started_at -= 3
+        self.client.get("/api/failover/status")  # readiness -> active
+        self.assertTrue(ctl.fallback_service_ready)
+
+    def test_fallback_sos_api_persists_locally_before_acceptance(self):
+        self.activate_fallback_api()
+        response = self.client.post("/api/fallback/sos", json={
+            "incident_id": "INC-fallback-api", "alert_type": "medical", "description": "local help"})
+        self.assertEqual(response.status_code, 201)
+        body = response.get_json()
+        self.assertEqual(body["status"], "accepted_locally")
+        self.assertIsNone(body["command_centre_receipt"])
+        self.assertEqual(appmod.fallback_store.pending_count(), 1)
+
+    def test_dashboard_failover_api_reports_persisted_runtime_and_queue(self):
+        self.activate_fallback_api()
+        self.client.post("/api/fallback/sos", json={"incident_id": "INC-dashboard-fallback", "alert_type": "other"})
+        state = self.client.get("/api/failover/status").get_json()
+        self.assertEqual(state["state"], "FALLBACK_ACTIVE")
+        self.assertEqual(state["pending_fallback_incidents"], 1)
+        self.assertFalse(state["physical_hardware_verified"])
+
+    def test_failover_simulation_controls_are_disabled_outside_test_mode(self):
+        old_testing = appmod.app.config["TESTING"]
+        appmod.app.config.update(TESTING=False)
+        try:
+            appmod.init_db()
+            response = self.client.post("/api/failover/simulate", json={"action": "power_off"})
+            self.assertEqual(response.status_code, 404)
+        finally:
+            appmod.app.config.update(TESTING=old_testing)
+
+    def test_failed_recovery_transfer_keeps_backup_outbox(self):
+        self.activate_fallback_api()
+        self.client.post("/api/fallback/sos", json={"incident_id": "INC-transfer-fail", "alert_type": "other"})
+        ctl = appmod.failover_controller
+        ctl.set_simulation(primary_running=True, primary_ready=True, drop_heartbeats=False)
+        ctl.tick(); ctl.tick()
+        self.client.post("/api/failover/simulate", json={"action": "fail_next_transfer"})
+        result = self.client.post("/api/failover/simulate", json={"action": "sync"})
+        self.assertEqual(result.get_json()["pending"], 1)
+        self.assertEqual(appmod.fallback_store.pending_count(), 1)
+        self.assertEqual(ctl.state.value, "DEGRADED")
+
+    def test_recovery_sync_commits_same_fallback_incident_to_destination(self):
+        self.activate_fallback_api()
+        report = self.client.post("/api/fallback/sos", json={
+            "incident_id": "INC-fallback-sync", "alert_type": "flood", "description": "rising water"})
+        self.assertEqual(report.status_code, 201)
+        ctl = appmod.failover_controller
+        ctl.set_simulation(primary_running=True, primary_ready=True, drop_heartbeats=False)
+        ctl.tick()  # authenticated heartbeat -> recovery
+        ctl.tick()  # readiness -> syncing
+        self.assertEqual(ctl.state.value, "SYNCING_INCIDENTS")
+        response = self.client.post("/api/failover/simulate", json={"action": "sync"})
+        self.assertEqual(response.status_code, 200, response.get_json())
+        cc = __import__('sqlite3').connect(appmod.CC_DB_PATH)
+        try:
+            destination = cc.execute("SELECT incident_id,origin_mode,source_node_id FROM command_centre_incidents WHERE incident_id=?", ("INC-fallback-sync",)).fetchone()
+        finally: cc.close()
+        self.assertIsNotNone(destination)
+        self.assertEqual(destination[1], "fallback")
+        self.assertEqual(destination[2], "esp32-backup-sim")
+        self.assertEqual(appmod.fallback_store.pending_count(), 0)
+
+    def test_lost_ack_retry_does_not_duplicate_command_centre_incident(self):
+        self.activate_fallback_api()
+        self.client.post("/api/fallback/sos", json={"incident_id":"INC-fallback-ack", "alert_type":"other"})
+        ctl = appmod.failover_controller
+        ctl.set_simulation(primary_running=True, primary_ready=True, drop_heartbeats=False)
+        ctl.tick(); ctl.tick()
+        self.client.post("/api/failover/simulate", json={"action":"lose_next_ack"})
+        first = self.client.post("/api/failover/simulate", json={"action":"sync"})
+        self.assertEqual(first.get_json()["pending"], 1)
+        self.assertEqual(appmod.fallback_store.pending_count(), 1)
+        second = self.client.post("/api/failover/simulate", json={"action":"sync"})
+        # The first failed reconciliation leaves the controller degraded; a fresh
+        # primary heartbeat/readiness cycle is required before retrying.
+        self.assertEqual(second.status_code, 409)
+        ctl.set_simulation(primary_running=True, primary_ready=True, drop_heartbeats=False)
+        ctl.monitor.last_received_at -= 6
+        ctl.tick(); ctl.tick()
+        self.assertEqual(ctl.state.value, "SYNCING_INCIDENTS")
+        retry = self.client.post("/api/failover/simulate", json={"action": "sync"})
+        self.assertEqual(retry.status_code, 200, retry.get_json())
+        cc = __import__('sqlite3').connect(appmod.CC_DB_PATH)
+        try:
+            count = cc.execute("SELECT count(*) FROM command_centre_incidents WHERE incident_id=?", ("INC-fallback-ack",)).fetchone()[0]
+        finally: cc.close()
+        self.assertEqual(count, 1)
+        self.assertEqual(appmod.fallback_store.pending_count(), 0)
+
+    def test_registration_persists_selected_role(self):
+        response = self.client.post("/api/register", json={
+            "username": "responder", "full_name": "Unit 4", "role": "responder",
+        })
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.get_json()["user"]["role"], "responder")
+        invalid = self.client.post("/api/register", json={
+            "username": "bad-role", "role": "root",
+        })
+        self.assertEqual(invalid.status_code, 400)
+
+    def test_dashboard_broadcast_is_validated_persisted_and_local_only(self):
+        invalid = self.client.post("/api/announcements", json={"content": " ", "category": "broadcast"})
+        self.assertEqual(invalid.status_code, 400)
+        response = self.client.post("/api/announcements", json={
+            "content": "Flood alert", "category": "flood_alert",
+        })
+        self.assertEqual(response.status_code, 201)
+        body = response.get_json()
+        self.assertEqual(body["delivery"], "local_application_only")
+        rows = self.client.get("/api/announcements").get_json()
+        self.assertEqual(rows[0]["content"], "Flood alert")
+
+    def test_dashboard_status_reports_simulated_transport_and_real_summary(self):
+        status = self.client.get("/api/status").get_json()
+        self.assertEqual(status["transport"], "simulated")
+        self.assertFalse(status["radio_verified"])
+        summary = self.client.get("/api/dashboard/summary").get_json()
+        self.assertIn("online_participants", summary)
+        self.assertIn("messages", summary)
+        self.assertIn("sos_today", summary)
+        self.assertGreaterEqual(summary["uptime_seconds"], 0)
+
+    def test_citizen_and_dashboard_templates_expose_required_controls(self):
+        citizen = self.client.get("/")
+        self.assertEqual(citizen.status_code, 200)
+        for marker in ("JOIN NETWORK", "CHAT", "CALL", "SOS", "MAP", "call-participant", "sos-grid"):
+            self.assertIn(marker.encode(), citizen.data)
+        self.assertEqual(self.client.get("/static/js/socket-client.js").status_code, 200)
+        worker = self.client.get("/service-worker.js")
+        self.assertEqual(worker.status_code, 200)
+        self.assertEqual(worker.headers.get("Service-Worker-Allowed"), "/")
+        dashboard = self.client.get("/dashboard")
+        self.assertEqual(dashboard.status_code, 200)
+        for marker in ("Incident Map", "SEND TO ALL", "CYCLONE WARNING", "activity-feed", "stat-uptime"):
+            self.assertIn(marker.encode(), dashboard.data)
+
+    def test_chat_post_is_saved_and_returned_by_real_message_api(self):
+        response = self.client.post("/api/messages", json={
+            "sender": "citizen", "content": "Test message", "is_broadcast": 1,
+        })
+        self.assertEqual(response.status_code, 201)
+        message = response.get_json()["message"]
+        rows = self.client.get("/api/messages?username=citizen").get_json()
+        self.assertTrue(any(row["id"] == message["id"] and row["content"] == "Test message" for row in rows))
+
+    def test_call_signalling_rejects_socket_without_session(self):
+        socket_client = appmod.socketio.test_client(appmod.app)
+        socket_client.emit("call:invite", {"to": "citizen"})
+        events = socket_client.get_received()
+        self.assertTrue(any(e["name"] == "call:error" for e in events))
+        socket_client.disconnect()
+
+    def test_session_bound_call_signalling_invite_accept_and_end(self):
+        caller_http = appmod.app.test_client()
+        callee_http = appmod.app.test_client()
+        self.assertEqual(caller_http.post("/api/register", json={"username": "caller"}).status_code, 201)
+        self.assertEqual(callee_http.post("/api/register", json={"username": "callee"}).status_code, 201)
+        caller = appmod.socketio.test_client(appmod.app, flask_test_client=caller_http)
+        callee = appmod.socketio.test_client(appmod.app, flask_test_client=callee_http)
+        caller.emit("call:invite", {"to": "callee"})
+        self.assertTrue(any(e["name"] == "call:invite" for e in callee.get_received()))
+        callee.emit("call:accept", {"to": "caller"})
+        self.assertTrue(any(e["name"] == "call:accepted" for e in caller.get_received()))
+        caller.emit("call:signal", {"to": "callee", "kind": "offer", "data": {"type": "offer", "sdp": "test"}})
+        self.assertTrue(any(e["name"] == "call:signal" for e in callee.get_received()))
+        caller.emit("call:end", {"to": "callee"})
+        self.assertTrue(any(e["name"] == "call:ended" for e in callee.get_received()))
+        caller.disconnect()
+        callee.disconnect()
+
+    def test_invalid_input_is_rejected(self):
+        self.assertEqual(self.sos(alert_type="not-real").status_code, 400)
+        self.assertEqual(self.sos(latitude=100).status_code, 400)
+        self.assertEqual(len(self.db_rows("SELECT * FROM alerts")), 0)
+
+    def test_queueing_while_transport_is_disconnected(self):
+        appmod.transport.configure(connected=False)
+        self.sos()
+        self.assertEqual(self.db_rows("SELECT state FROM outbound_queue")[0][0], "queued")
+        self.assertEqual(self.db_rows("SELECT delivery_status FROM alerts")[0][0], "queued")
+
+    def test_delivery_after_transport_reconnection(self):
+        appmod.transport.configure(connected=False)
+        self.sos()
+        appmod.transport.configure(connected=True)
+        self.assertEqual(self.db_rows("SELECT state FROM outbound_queue")[0][0], "delivered")
+        self.assertEqual(self.db_rows("SELECT delivery_status FROM alerts")[0][0], "received_by_command_centre")
+
+    def test_incident_id_is_stable_across_retries(self):
+        appmod.transport.configure(connected=False)
+        first = self.sos("INC-stable-retry")
+        second = self.sos("INC-stable-retry")
+        self.assertEqual(first.status_code, 201)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(second.get_json()["alert"]["incident_id"], "INC-stable-retry")
+        self.assertEqual(len(self.db_rows("SELECT * FROM alerts")), 1)
+
+    def test_duplicate_delivery_is_suppressed(self):
+        self.sos("INC-deduplicate")
+        appmod.transport.process_queue()
+        cc = __import__('sqlite3').connect(appmod.CC_DB_PATH)
+        self.assertEqual(cc.execute("SELECT count(*) FROM command_centre_incidents WHERE incident_id=?", ("INC-deduplicate",)).fetchone()[0], 1)
+        cc.close()
+        self.assertEqual(len(self.db_rows("SELECT * FROM alerts WHERE incident_id=?", ("INC-deduplicate",))), 1)
+
+    def test_no_false_receipt_before_command_centre_storage(self):
+        appmod.transport.configure(lose_next_ack=True)
+        response = self.sos("INC-lost-ack")
+        self.assertEqual(response.get_json()["alert"]["delivery_status"], "queued")
+        cc=__import__('sqlite3').connect(appmod.CC_DB_PATH)
+        self.assertEqual(cc.execute("SELECT count(*) FROM command_centre_incidents WHERE incident_id=?", ("INC-lost-ack",)).fetchone()[0], 1); cc.close()
+        self.assertEqual(self.db_rows("SELECT state FROM outbound_queue WHERE incident_id=?", ("INC-lost-ack",))[0][0], "queued")
+
+    def test_retry_after_lost_acknowledgement(self):
+        appmod.transport.configure(lose_next_ack=True)
+        self.sos("INC-retry-ack")
+        appmod.transport.process_queue()
+        self.assertEqual(self.db_rows("SELECT delivery_status FROM alerts WHERE incident_id=?", ("INC-retry-ack",))[0][0], "received_by_command_centre")
+        cc=__import__('sqlite3').connect(appmod.CC_DB_PATH)
+        self.assertEqual(cc.execute("SELECT count(*) FROM command_centre_incidents WHERE incident_id=?", ("INC-retry-ack",)).fetchone()[0], 1); cc.close()
+
+    def test_queue_and_incident_survive_application_restart(self):
+        appmod.transport.configure(connected=False)
+        self.sos("INC-restart")
+        # A fresh transport instance and init_db emulate a process restart.
+        appmod.transport = appmod.SimulatedTransport()
+        appmod.init_db()
+        self.assertEqual(appmod.transport.connected,False)
+        self.assertEqual(self.db_rows("SELECT state FROM outbound_queue WHERE incident_id=?", ("INC-restart",))[0][0],"queued")
+        appmod.transport.configure(connected=True)
+        self.assertEqual(self.db_rows("SELECT state FROM outbound_queue WHERE incident_id=?", ("INC-restart",))[0][0], "delivered")
+        self.assertEqual(self.db_rows("SELECT delivery_status FROM alerts WHERE incident_id=?", ("INC-restart",))[0][0], "received_by_command_centre")
+
+    def test_responder_assignment_is_distinct_from_receipt(self):
+        self.sos("INC-assignment")
+        before = self.db_rows("SELECT delivery_status FROM alerts WHERE incident_id=?", ("INC-assignment",))[0][0]
+        self.assertEqual(before, "received_by_command_centre")
+        response = self.client.post("/api/incidents/INC-assignment/assign", json={"responder": "Unit 7"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.db_rows("SELECT delivery_status,lifecycle_status FROM alerts WHERE incident_id=?", ("INC-assignment",))[0][:], ("received_by_command_centre","responder_assigned"))
+
+    def test_anonymous_sos_without_location(self):
+        response=self.client.post('/api/sos',json={'incident_id':'INC-anon','alert_type':'other'})
+        self.assertEqual(response.status_code,201)
+        self.assertIsNone(response.get_json()['alert']['latitude'])
+
+    def test_partial_and_invalid_coordinates_rejected(self):
+        self.assertEqual(self.sos('INC-partial',latitude=12.0,longitude=None).status_code,400)
+        self.assertEqual(self.sos('INC-invalid',latitude='north',longitude=4).status_code,400)
+
+    def test_idempotency_header_keeps_same_incident(self):
+        one=self.client.post('/api/sos',json={'incident_id':'INC-key-one'},headers={'Idempotency-Key':'retry-key'})
+        two=self.client.post('/api/sos',json={'incident_id':'INC-key-two'},headers={'Idempotency-Key':'retry-key'})
+        self.assertEqual(one.get_json()['alert']['incident_id'],two.get_json()['alert']['incident_id'])
+        self.assertEqual(len(self.db_rows('SELECT * FROM alerts')),1)
+
+    def test_failed_transmission_keeps_queued_incident_and_retries(self):
+        appmod.transport.configure(fail_next_transmission=True)
+        response=self.sos('INC-failed-send')
+        self.assertEqual(response.get_json()['alert']['delivery_status'],'queued')
+        self.assertEqual(self.db_rows("SELECT outcome FROM delivery_attempts WHERE incident_id='INC-failed-send'")[0][0],'failed')
+        appmod.transport.process_queue()
+        self.assertEqual(self.db_rows("SELECT delivery_status FROM alerts WHERE incident_id='INC-failed-send'")[0][0],'received_by_command_centre')
+
+    def test_followup_updates_same_incident(self):
+        self.sos('INC-followup')
+        response=self.client.post('/api/incidents/INC-followup/updates',json={'description':'two people trapped','landmark':'near bridge'})
+        self.assertEqual(response.status_code,200)
+        row=self.db_rows("SELECT description,landmark FROM alerts WHERE incident_id='INC-followup'")[0]
+        self.assertEqual(tuple(row),('two people trapped','near bridge'))
+
+    def test_lifecycle_requires_ordered_separate_events(self):
+        self.sos('INC-lifecycle')
+        for target in ['dispatched','arrived','resolved']:
+            self.assertEqual(self.client.post('/api/incidents/INC-lifecycle/lifecycle',json={'status':target}).status_code,409)
+        self.client.post('/api/incidents/INC-lifecycle/assign',json={'responder':'Unit 3'})
+        for target in ['dispatched','arrived','resolved']:
+            if target=='arrived':
+                # Reassignment changes the unit but must not rewind lifecycle.
+                self.client.post('/api/incidents/INC-lifecycle/assign',json={'responder':'Unit 4'})
+                self.assertEqual(self.db_rows("SELECT lifecycle_status FROM alerts WHERE incident_id='INC-lifecycle'")[0][0],'dispatched')
+            response=self.client.post('/api/incidents/INC-lifecycle/lifecycle',json={'status':target})
+            self.assertEqual(response.status_code,200)
+        self.assertEqual(self.db_rows("SELECT lifecycle_status FROM alerts WHERE incident_id='INC-lifecycle'")[0][0],'resolved')
+
+    def test_dashboard_api_reflects_persisted_receipt_and_history(self):
+        self.sos('INC-dashboard')
+        response=self.client.get('/api/incidents')
+        self.assertEqual(response.status_code,200)
+        incident=next(x for x in response.get_json() if x['incident_id']=='INC-dashboard')
+        self.assertEqual(incident['delivery_status'],'received_by_command_centre')
+        self.assertTrue(any(x['status']=='received_by_command_centre' for x in incident['history']))
+
+    def test_genuine_receipt_id_is_returned_after_receiver_commit(self):
+        response=self.sos('INC-receipt-proof')
+        self.assertEqual(response.get_json()['alert']['receipt_id'],'RCP-INC-receipt-proof')
+        cc=__import__('sqlite3').connect(appmod.CC_DB_PATH)
+        saved=cc.execute("SELECT receipt_id FROM command_centre_receipts WHERE incident_id='INC-receipt-proof'").fetchone()[0]
+        self.assertEqual(saved,response.get_json()['alert']['receipt_id'])
+        cc.close()
+
+    def test_repeated_acknowledgements_do_not_duplicate_history(self):
+        self.sos('INC-repeat-ack')
+        for _ in range(4): appmod.transport.process_queue()
+        self.assertEqual(len(self.db_rows("SELECT * FROM incident_events WHERE incident_id='INC-repeat-ack' AND status='received_by_command_centre'")),1)
+
+    def test_simulated_receiver_store_is_separate(self):
+        self.sos('INC-separate-store')
+        names=[r[0] for r in self.db_rows("SELECT name FROM sqlite_master WHERE type='table'")]
+        self.assertNotIn('command_centre_incidents',names)
+        self.assertNotIn('command_centre_receipts',names)
+        cc=__import__('sqlite3').connect(appmod.CC_DB_PATH)
+        self.assertEqual(cc.execute("SELECT receipt_id FROM command_centre_receipts WHERE incident_id='INC-separate-store'").fetchone()[0],'RCP-INC-separate-store')
+        cc.close()
+
+    def test_repeated_retries_keep_one_stable_incident_and_history(self):
+        appmod.transport.configure(connected=False)
+        responses=[self.sos('INC-many-retries') for _ in range(8)]
+        self.assertEqual(responses[-1].get_json()['alert']['incident_id'],'INC-many-retries')
+        self.assertEqual(len(self.db_rows("SELECT * FROM alerts WHERE incident_id='INC-many-retries'")),1)
+        self.assertEqual(len(self.db_rows("SELECT * FROM outbound_queue WHERE incident_id='INC-many-retries'")),1)
+
+    def test_reinitialization_preserves_existing_records(self):
+        self.sos('INC-preserve')
+        before=len(self.db_rows('SELECT * FROM alerts'))
+        appmod.transport.configure(connected=False)
+        appmod.init_db()
+        self.assertEqual(len(self.db_rows('SELECT * FROM alerts')),before)
+        self.assertIsNotNone(self.db_rows("SELECT incident_id FROM alerts WHERE incident_id='INC-preserve'")[0][0])
+
+
+if __name__ == "__main__":
+    unittest.main()

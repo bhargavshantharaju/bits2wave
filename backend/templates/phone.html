@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#071321">
+  <title>NexAlert · Emergency Communication Network</title>
+  <link rel="stylesheet" href="/static/css/phone.css">
+</head>
+<body>
+  <section id="reg-screen" class="screen active" aria-labelledby="brand-title">
+    <header class="status-header"><span class="status-dot" id="server-dot"></span><span id="server-status">Checking server…</span><span class="radio-state">RADIO: NOT VERIFIED</span></header>
+    <div class="onboard-card">
+      <div class="brand-lockup">
+        <svg class="brand-mark" viewBox="0 0 64 64" aria-hidden="true"><path d="M32 9v34M24 43h16M20 53h24M13 35a27 27 0 0 1 0-38M51 35a27 27 0 0 0 0-38M21 29a17 17 0 0 1 0-24M43 29a17 17 0 0 0 0-24" transform="translate(0 8)" fill="none" stroke="currentColor" stroke-width="4" stroke-linecap="round"/><circle cx="32" cy="53" r="4" fill="currentColor"/></svg>
+        <h1 id="brand-title">NEX<span>ALERT</span></h1>
+        <p>EMERGENCY COMMUNICATION NETWORK</p>
+      </div>
+      <form id="join-form" class="join-form">
+        <label for="reg-name">Name <small>(optional)</small></label>
+        <input id="reg-name" maxlength="200" autocomplete="name" placeholder="How should we identify you?">
+        <label for="reg-role">Network role</label>
+        <select id="reg-role"><option value="civilian" selected>Civilian</option><option value="responder">Responder</option><option value="operator">Operator</option></select>
+        <button class="primary-button" type="submit">JOIN NETWORK <span aria-hidden="true">→</span></button>
+      </form>
+      <p id="reg-error" class="notice" role="status" aria-live="polite"></p>
+      <button id="guest-continue" class="text-button" type="button">Continue to emergency tools without joining</button>
+      <p class="privacy-note">No phone number or location is required. Location is requested only if you choose to attach it to an SOS.</p>
+    </div>
+  </section>
+
+  <section id="app-screen" class="screen app-shell" aria-label="NexAlert citizen app">
+    <header class="app-header">
+      <a class="mini-brand" href="#" aria-label="NexAlert home"><span class="mini-mark">⌁</span><strong>NEX<span>ALERT</span></strong></a>
+      <div class="header-status"><span class="status-dot" id="app-server-dot"></span><span id="app-server-status">Server checking</span><span class="header-divider"></span><span id="app-transport-status">SIMULATED LINK</span></div>
+      <div id="user-display" class="user-chip">Guest</div>
+    </header>
+
+    <main class="tab-content">
+      <section id="tab-chat" class="tab-panel active" aria-label="Chat">
+        <div class="panel-heading"><div><p class="eyebrow">NETWORK MESSAGES</p><h2>Chat</h2></div><span id="online-count" class="count-pill">— online</span></div>
+        <div class="chat-toolbar"><label class="sr-only" for="chat-recipient">Send to</label><select id="chat-recipient"><option value="">Network broadcast</option></select></div>
+        <div id="chat-state" class="inline-state" role="status">Loading messages…</div>
+        <div id="messages-container" class="messages-list" aria-live="polite"></div>
+        <form id="message-form" class="chat-input-bar"><label class="sr-only" for="msg-input">Message</label><input id="msg-input" maxlength="500" placeholder="Write a message…" autocomplete="off"><button class="btn-send" aria-label="Send message" type="submit">↑</button></form>
+      </section>
+
+      <section id="tab-call" class="tab-panel" aria-label="Voice call" hidden>
+        <div class="panel-heading"><div><p class="eyebrow">LOCAL WI-FI AUDIO</p><h2>Call</h2></div><span class="feature-state">BROWSER CALL</span></div>
+        <p id="call-security-note" class="call-note">Calls require trusted HTTPS or localhost. Signalling uses the current app session, but registration has no verified identity credentials; do not use prototype calls for sensitive communication. Microphone access is requested only after you start or accept.</p>
+        <label class="field-label" for="call-participant">Participant</label><select id="call-participant" class="large-control"><option value="">Choose an online participant</option></select>
+        <div id="incoming-call" class="incoming-call" hidden><p><strong id="incoming-caller">Incoming call</strong></p><button id="accept-call" class="primary-button" type="button">Accept call</button><button id="decline-call" class="secondary-button" type="button">Decline</button></div>
+        <div class="call-orb" aria-hidden="true"><span>☎</span></div>
+        <audio id="remote-audio" autoplay playsinline></audio>
+        <p id="call-state" class="call-state" role="status" aria-live="polite">Ready · voice travels over local Wi-Fi, never LoRa</p>
+        <div class="call-controls"><button id="start-call" class="primary-button" type="button">Start call</button><button id="mute-call" class="secondary-button" type="button" disabled>Mute</button><button id="hangup-call" class="danger-button" type="button" disabled>End call</button></div>
+      </section>
+
+      <section id="tab-sos" class="tab-panel sos-panel" aria-label="Emergency SOS" hidden>
+        <div class="panel-heading"><div><p class="eyebrow">EMERGENCY RESPONSE</p><h2><span class="alert-mark">!</span> SOS</h2></div><span class="urgent-pill">URGENT</span></div>
+        <p class="sos-intro">Choose the help you need. Your report is saved before delivery is attempted.</p>
+        <div id="sos-grid" class="sos-grid"></div>
+        <details class="optional-details"><summary>Add optional details</summary><label class="field-label" for="sos-desc">Description</label><textarea id="sos-desc" rows="3" maxlength="1000" placeholder="What should responders know?"></textarea><label class="field-label" for="sos-landmark">Landmark</label><input id="sos-landmark" maxlength="250" placeholder="Nearby landmark"><button class="secondary-button" id="attach-location" type="button">＋ Attach current location</button><small id="location-status" role="status">Location not attached</small></details>
+        <p id="sos-status" class="sos-status" role="status" aria-live="polite">SOS works without joining or location.</p>
+        <section id="sos-followup" class="followup" hidden><h3>Update the same report</h3><label class="field-label" for="followup-description">Additional details</label><textarea id="followup-description" maxlength="1000" rows="2"></textarea><label class="field-label" for="followup-landmark">Landmark</label><input id="followup-landmark" maxlength="250"><button class="secondary-button" id="send-followup" type="button">Send update</button></section>
+      </section>
+
+      <section id="tab-map" class="tab-panel map-panel" aria-label="Incident map">
+        <div class="panel-heading"><div><p class="eyebrow">LIVE REPORTS</p><h2>Map</h2></div><span class="feature-state">LOCAL DATA</span></div>
+        <div class="map-availability">Regional offline map data is not installed. This coordinate plot uses reported incident locations only.</div>
+        <div id="citizen-map" class="coordinate-map" role="img" aria-label="Coordinate plot of reported incidents"></div>
+        <h3 class="subheading">Reported incidents</h3><div id="citizen-incident-list" class="incident-list"><p class="empty-state">Loading incident data…</p></div>
+        <h3 class="subheading">Unmapped reports</h3><div id="citizen-unknown-list" class="incident-list"><p class="empty-state">Loading…</p></div>
+      </section>
+    </main>
+
+    <nav class="bottom-nav" aria-label="Main navigation">
+      <button class="nav-btn active" data-tab="chat" type="button"><span>▤</span><small>CHAT</small></button>
+      <button class="nav-btn" data-tab="call" type="button"><span>⌕</span><small>CALL</small></button>
+      <button class="nav-btn sos-nav" data-tab="sos" type="button"><span>!</span><small>SOS</small></button>
+      <button class="nav-btn" data-tab="map" type="button"><span>⌖</span><small>MAP</small></button>
+    </nav>
+  </section>
+
+  <script>window.NEXALERT_TYPES = {{ alert_types|tojson }};</script>
+  <script src="/static/js/socket-client.js"></script>
+  <script src="/static/js/phone.js"></script>
+  <script>if ('serviceWorker' in navigator) navigator.serviceWorker.register('/service-worker.js', {scope:'/'}).catch(() => {});</script>
+</body>
+</html>

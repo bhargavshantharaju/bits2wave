@@ -1,0 +1,9 @@
+.venv/
+.venv-*/
+.pip-cache/
+.pip-tmp/
+.wheelhouse/
+__pycache__/
+*.py[cod]
+database/*.db*
+logs/*.log

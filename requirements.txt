@@ -1,0 +1,21 @@
+# NexAlert v3.0 Requirements
+# Pinned for Raspberry Pi / Python 3.9–3.11 compatibility
+#
+# DO NOT add eventlet or gevent — they conflict with GPIO libs
+# and require monkey-patching that breaks BalenaOS containers.
+# Flask-SocketIO threading mode is used instead.
+
+Flask==3.0.3
+Flask-SocketIO==5.3.6
+Flask-Cors==4.0.1
+python-socketio==5.11.2
+python-engineio==4.9.1
+
+# Serial comms for ESP32 / Meshtastic
+pyserial==3.5
+
+# HTTP requests (for Meshtastic API, Agmarknet, etc.)
+requests==2.31.0
+
+# Env var management
+python-dotenv==1.0.1

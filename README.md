@@ -272,8 +272,8 @@ The citizen interface now has CHAT, CALL, SOS and MAP tabs in the existing Flask
 
 ## Team
 
-- Team: **[LOOSE CREWS]**
-- Members: **[Bhargav S Raj , M Hasini]**
+- Team: **LOOSE CREWS**
+- Members: **Bhargav S Raj , M Hasini**
 - Institution: **BMS Institute of Technology and Management (BMSIT&M), Bengaluru, India**
 - Event: **Bits2Wave**
 

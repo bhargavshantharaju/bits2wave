@@ -4,6 +4,7 @@ import argparse
 import getpass
 import re
 import sqlite3
+import uuid
 
 from werkzeug.security import generate_password_hash
 
@@ -24,14 +25,21 @@ def main():
     app_module.init_db()
     conn=sqlite3.connect(app_module.DB_PATH)
     try:
-        existing=conn.execute("SELECT id FROM users WHERE username=?",(args.username,)).fetchone()
+        existing=conn.execute("SELECT id,role FROM users WHERE username=?",(args.username,)).fetchone()
         password_hash=generate_password_hash(password,method="scrypt")
         if existing:
+            if existing[1] != "operator":
+                raise SystemExit("refusing to convert an existing non-operator account; choose a new operator username")
             conn.execute("UPDATE users SET role='operator',full_name=?,password_hash=?,session_version=session_version+1,auth_failed_attempts=0,auth_locked_until=NULL WHERE id=?",
                          (args.display_name or args.username,password_hash,existing[0]))
+            conn.execute("INSERT INTO security_events(actor_id,event,outcome,source_hash,detail) VALUES(?,?,?,?,?)",
+                         (existing[0],"operator_credential_rotation","success","local-cli","all prior sessions revoked"))
         else:
-            conn.execute("INSERT INTO users(username,full_name,phone,role,password_hash) VALUES(?,?,'','operator',?)",
-                         (args.username,args.display_name or args.username,password_hash))
+            conn.execute("INSERT INTO users(identity_id,username,full_name,phone,role,password_hash) VALUES(?,?,?,'','operator',?)",
+                         (str(uuid.uuid4()),args.username,args.display_name or args.username,password_hash))
+            operator_id=conn.execute("SELECT id FROM users WHERE username=?",(args.username,)).fetchone()[0]
+            conn.execute("INSERT INTO security_events(actor_id,event,outcome,source_hash,detail) VALUES(?,?,?,?,?)",
+                         (operator_id,"operator_provision","success","local-cli","new local operator account"))
         conn.commit()
     finally:
         conn.close()

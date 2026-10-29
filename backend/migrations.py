@@ -1,6 +1,7 @@
 """Additive SQLite schema migration for the Phase 1 SOS workflow."""
 
 import sqlite3
+import uuid
 from typing import Callable
 
 
@@ -31,6 +32,28 @@ def migrate_sos_schema(conn: sqlite3.Connection, new_incident_id: Callable[[], s
                 conn.execute(f"ALTER TABLE alerts ADD COLUMN {name} {declaration}")
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_alerts_incident_id ON alerts(incident_id)")
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_alerts_idempotency ON alerts(idempotency_key) WHERE idempotency_key IS NOT NULL")
+        alert_cols = {row[1] for row in conn.execute("PRAGMA table_info(alerts)")}
+        if "priority" not in alert_cols:
+            conn.execute("ALTER TABLE alerts ADD COLUMN priority TEXT NOT NULL DEFAULT 'high'")
+        if "incident_capability_hash" not in alert_cols:
+            conn.execute("ALTER TABLE alerts ADD COLUMN incident_capability_hash TEXT")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_alerts_capability ON alerts(incident_capability_hash)")
+        conn.execute("CREATE TABLE IF NOT EXISTS outbound_queue ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT,incident_id TEXT NOT NULL UNIQUE,"
+            "state TEXT NOT NULL DEFAULT 'queued',attempts INTEGER NOT NULL DEFAULT 0,"
+            "last_attempt_at TEXT DEFAULT NULL,delivered_at TEXT DEFAULT NULL,"
+            "created_at TEXT DEFAULT(datetime('now')))")
+        queue_cols = {row[1] for row in conn.execute("PRAGMA table_info(outbound_queue)")}
+        queue_additions = {
+            "next_attempt_at": "TEXT NOT NULL DEFAULT ''",
+            "max_attempts": "INTEGER NOT NULL DEFAULT 8",
+            "failure_reason": "TEXT DEFAULT NULL",
+            "priority": "INTEGER NOT NULL DEFAULT 1",
+        }
+        for name, declaration in queue_additions.items():
+            if name not in queue_cols:
+                conn.execute(f"ALTER TABLE outbound_queue ADD COLUMN {name} {declaration}")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_outbound_queue_ready ON outbound_queue(state, priority DESC, next_attempt_at, id)")
         conn.execute("""CREATE TABLE IF NOT EXISTS incident_events(
             id INTEGER PRIMARY KEY, incident_id TEXT NOT NULL, status TEXT NOT NULL,
             detail TEXT DEFAULT '', created_at TEXT DEFAULT(datetime('now')))""")
@@ -68,11 +91,25 @@ def migrate_security_schema(conn: sqlite3.Connection) -> None:
             "password_hash": "TEXT DEFAULT NULL",
             "auth_failed_attempts": "INTEGER NOT NULL DEFAULT 0",
             "auth_locked_until": "TEXT DEFAULT NULL",
+            "identity_id": "TEXT",
         }
         user_cols = {row[1] for row in conn.execute("PRAGMA table_info(users)")}
         for name, declaration in additions.items():
             if name not in user_cols:
                 conn.execute(f"ALTER TABLE users ADD COLUMN {name} {declaration}")
+        for row in conn.execute("SELECT id FROM users WHERE identity_id IS NULL OR identity_id='' ").fetchall():
+            conn.execute("UPDATE users SET identity_id=? WHERE id=?", (str(uuid.uuid4()), row[0]))
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_identity_id ON users(identity_id)")
+        alert_cols={row[1] for row in conn.execute("PRAGMA table_info(alerts)")}
+        ownership_additions={
+            "ownership_state": "TEXT NOT NULL DEFAULT 'legacy_unverified'",
+            "owner_identity_id": "TEXT",
+            "ownership_issuer": "TEXT",
+            "ownership_assertion_digest": "TEXT",
+        }
+        for name,declaration in ownership_additions.items():
+            if name not in alert_cols:
+                conn.execute(f"ALTER TABLE alerts ADD COLUMN {name} {declaration}")
         announcement_cols = {row[1] for row in conn.execute("PRAGMA table_info(system_announcements)")}
         if "created_by" not in announcement_cols:
             conn.execute("ALTER TABLE system_announcements ADD COLUMN created_by INTEGER REFERENCES users(id)")
@@ -86,6 +123,13 @@ def migrate_security_schema(conn: sqlite3.Connection) -> None:
             outcome TEXT NOT NULL,
             created_at TEXT NOT NULL DEFAULT(datetime('now'))
         )""")
+        conn.execute("CREATE TABLE IF NOT EXISTS security_events ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT,actor_id INTEGER,"
+            "event TEXT NOT NULL,outcome TEXT NOT NULL,source_hash TEXT,"
+            "detail TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL DEFAULT(datetime('now')))")
+        conn.execute("CREATE TABLE IF NOT EXISTS request_rate_limits ("
+            "scope TEXT NOT NULL,key_hash TEXT NOT NULL,window_start INTEGER NOT NULL,hits INTEGER NOT NULL,"
+            "PRIMARY KEY(scope,key_hash,window_start))")
         migrated = conn.execute("SELECT 1 FROM security_migrations WHERE name='trusted-roles-v1'").fetchone()
         if not migrated:
             conn.execute("UPDATE users SET role='citizen'")

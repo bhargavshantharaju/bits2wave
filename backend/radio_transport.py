@@ -140,7 +140,7 @@ class RadioSosTransport(SosTransport):
             # Diagnostics must not turn a durable queued report into an HTTP 500.
             self.last_error = f"attempt journal callback failed: {exc}"
 
-    def process_queue(self) -> int:
+    def process_queue(self, limit: int | None = None) -> int:
         """Send pending records; return count with persistent destination receipts."""
         self.last_error = ""
         if not bool(getattr(self.link, "connected", False)):
@@ -156,7 +156,8 @@ class RadioSosTransport(SosTransport):
             self.last_error = f"outbox read failed: {exc}"
             self.last_event = "outbox_error"
             return 0
-        for report in islice(queued, self.max_batch):
+        batch_limit = self.max_batch if limit is None else max(1, min(int(limit), self.max_batch))
+        for report in islice(queued, batch_limit):
             try:
                 frame = sos_frame(report, self.node_id, self.peer_id)
                 packet = encode(frame)  # Keep these exact bytes and IDs on every retry.

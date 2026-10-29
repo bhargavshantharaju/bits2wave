@@ -7,7 +7,7 @@ class SosTransport(ABC):
     """Transport boundary; delivery means a persistent command-centre receipt."""
 
     @abstractmethod
-    def process_queue(self):
+    def process_queue(self, limit=None):
         """Try durable pending messages without changing their incident IDs."""
 
     def status(self):

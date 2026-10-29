@@ -73,6 +73,8 @@ class SosMigrationTests(unittest.TestCase):
         self.assertEqual(self.conn.execute("SELECT * FROM users ORDER BY id").fetchall(), before_users)
         self.assertEqual(self.conn.execute("SELECT count(*) FROM alerts WHERE incident_id LIKE 'INC-%'").fetchone()[0], 1)
         self.assertEqual(self.conn.execute("SELECT lifecycle_status FROM alerts WHERE id=1").fetchone()[0], "saved_locally")
+        self.assertIn("incident_capability_hash",{row[1] for row in self.conn.execute("PRAGMA table_info(alerts)")})
+        self.assertIsNone(self.conn.execute("SELECT incident_capability_hash FROM alerts WHERE id=1").fetchone()[0])
         self.assertEqual(self.conn.execute("PRAGMA integrity_check").fetchone()[0], "ok")
 
     def test_migration_is_repeatable_and_adds_constraints(self):
@@ -119,6 +121,9 @@ class SosMigrationTests(unittest.TestCase):
         self.assertEqual(self.conn.execute("SELECT id,user_id FROM alerts WHERE id=1").fetchone(),(1,1))
         self.assertIn("created_by",{row[1] for row in self.conn.execute("PRAGMA table_info(system_announcements)")})
         self.assertIsNotNone(self.conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='operator_actions'").fetchone())
+        identity=self.conn.execute("SELECT identity_id FROM users WHERE id=1").fetchone()[0]
+        self.assertTrue(identity)
+        self.assertEqual(self.conn.execute("SELECT ownership_state,owner_identity_id FROM alerts WHERE id=1").fetchone(),("legacy_unverified",None))
 
 
 if __name__ == "__main__":

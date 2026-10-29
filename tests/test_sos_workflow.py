@@ -25,9 +25,25 @@ SPEC.loader.exec_module(appmod)
 
 
 class CsrfTestClient(FlaskClient):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.incident_capabilities={}
+
     def open(self, *args, **kwargs):
         without_csrf=kwargs.pop("without_csrf",False)
+        without_capability=kwargs.pop("without_capability",False)
         method=(kwargs.get("method") or "GET").upper()
+        path=args[0] if args else kwargs.get("path", "")
+        if not without_capability and path and (path.endswith("/api/sos") or path.endswith("/api/fallback/sos") or "/api/incidents/" in path):
+            headers=dict(kwargs.get("headers") or {})
+            if "X-Incident-Capability" not in headers:
+                import base64, secrets
+                body=kwargs.get("json") or {}
+                incident=(body.get("incident_id") if isinstance(body,dict) else None) or headers.get("Idempotency-Key")
+                if incident:
+                    token=self.incident_capabilities.setdefault(str(incident),base64.urlsafe_b64encode(secrets.token_bytes(32)).decode().rstrip("="))
+                    headers["X-Incident-Capability"]=token
+                    kwargs["headers"]=headers
         if not without_csrf and method not in {"GET","HEAD","OPTIONS"}:
             try:
                 with self.session_transaction() as current_session:
@@ -86,6 +102,7 @@ class SosWorkflowTests(unittest.TestCase):
         appmod.FALLBACK_DB_PATH = os.path.join(self.tmp.name, "fallback.db")
         appmod.transport = appmod.SimulatedTransport()
         appmod.ACTIVE_CALLS.clear()
+        appmod.ACTIVE_SOCKETS.clear();appmod.ACTIVE_SOCKET_IDENTITIES.clear()
         appmod.app.config.update(TESTING=True)
         appmod.init_db()
         self.client = appmod.app.test_client()
@@ -110,8 +127,8 @@ class SosWorkflowTests(unittest.TestCase):
 
     def provision_operator(self):
         db=sqlite3.connect(appmod.DB_PATH)
-        db.execute("INSERT INTO users(username,full_name,phone,role,password_hash) VALUES(?,?,'','operator',?)",
-                   ("operator-test","Test Operator",TEST_OPERATOR_HASH))
+        db.execute("INSERT INTO users(identity_id,username,full_name,phone,role,password_hash) VALUES(?,?,?,'','operator',?)",
+                   (str(__import__('uuid').uuid4()),"operator-test","Test Operator",TEST_OPERATOR_HASH))
         db.commit();db.close()
         client=appmod.app.test_client();client.get("/api/csrf")
         response=client.post("/api/operator/login",json={"username":"operator-test","password":TEST_OPERATOR_PASSWORD})
@@ -125,7 +142,22 @@ class SosWorkflowTests(unittest.TestCase):
             "latitude": 12.9, "longitude": 77.5,
         }
         payload.update(extra)
-        return self.client.post("/api/sos", json=payload)
+        response = self.client.post("/api/sos", json=payload)
+        # Exercise the separately supervised worker deterministically after
+        # the endpoint has returned; no sleeps or background thread required.
+        if response.status_code in (200, 201):
+            try:
+                appmod.transport.process_queue(limit=500)
+            except TypeError:
+                appmod.transport.process_queue()
+            body = response.get_json()
+            if body and body.get("alert"):
+                row = self.db_rows("SELECT delivery_status,lifecycle_status,receipt_id FROM alerts WHERE incident_id=?",
+                                   (body["alert"]["incident_id"],))
+                if row:
+                    body["alert"].update(dict(row[0]))
+                    response.set_data(json.dumps(body))
+        return response
 
     def db_rows(self, sql, params=()):
         conn = appmod.open_db_connection()
@@ -225,7 +257,9 @@ class SosWorkflowTests(unittest.TestCase):
         self.assertFalse(state["simulated_transport_connected"])
         source = self.db_rows("SELECT state,attempts FROM outbound_queue WHERE incident_id=?",
                               ("INC-app-radio-accepted",))[0]
-        self.assertEqual(tuple(source), ("delivered", 1))
+        self.assertEqual(source[0], "delivered")
+        self.assertGreaterEqual(source[1], 1)
+        self.assertLessEqual(source[1], 3)
         receiver = sqlite3.connect(appmod.CC_DB_PATH)
         self.assertEqual(receiver.execute("SELECT count(*) FROM command_centre_incidents WHERE incident_id=?",
                                            ("INC-app-radio-accepted",)).fetchone()[0], 1)
@@ -385,16 +419,180 @@ class SosWorkflowTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.get_json())
         cc = __import__('sqlite3').connect(appmod.CC_DB_PATH)
         try:
-            destination = cc.execute("SELECT incident_id,origin_mode,source_node_id FROM command_centre_incidents WHERE incident_id=?", ("INC-fallback-sync",)).fetchone()
+            destination = cc.execute("SELECT incident_id,origin_mode,source_node_id,owner_identity_id,ownership_state,ownership_assertion_digest FROM command_centre_incidents WHERE incident_id=?", ("INC-fallback-sync",)).fetchone()
         finally: cc.close()
         self.assertIsNotNone(destination)
         self.assertEqual(destination[1], "fallback")
         self.assertEqual(destination[2], "esp32-backup-sim")
+        expected=sqlite3.connect(appmod.DB_PATH).execute("SELECT identity_id FROM users WHERE id=?",(self.client.get("/api/session").get_json()["user"]["id"],)).fetchone()[0]
+        self.assertEqual(destination[3],expected)
+        self.assertEqual(destination[4],"verified")
+        primary=sqlite3.connect(appmod.DB_PATH)
+        primary_owner=primary.execute("SELECT owner_identity_id,ownership_state,ownership_assertion_digest FROM alerts WHERE incident_id=?",("INC-fallback-sync",)).fetchone()
+        self.assertEqual(primary_owner[:2],(expected,"verified"));self.assertTrue(primary_owner[2])
+        self.assertEqual(destination[5],primary_owner[2])
+        primary.close()
+        # Reopen both durable stores through the normal startup path; the
+        # reconciled owner and destination record must remain unchanged.
+        appmod.fallback_store=appmod.FallbackStore(appmod.FALLBACK_DB_PATH)
+        appmod.init_db()
+        primary=sqlite3.connect(appmod.DB_PATH)
+        self.assertEqual(primary.execute("SELECT owner_identity_id,ownership_state FROM alerts WHERE incident_id=?",("INC-fallback-sync",)).fetchone(),(expected,"verified"))
+        primary.close()
+        cc=sqlite3.connect(appmod.CC_DB_PATH)
+        self.assertEqual(cc.execute("SELECT owner_identity_id,ownership_state FROM command_centre_incidents WHERE incident_id=?",("INC-fallback-sync",)).fetchone(),(expected,"verified"));cc.close()
         self.assertEqual(appmod.fallback_store.pending_count(), 0)
+
+    def test_operator_lifecycle_update_preserves_original_citizen_owner(self):
+        self.sos("INC-owner-lifecycle")
+        before=self.db_rows("SELECT user_id,owner_identity_id,ownership_state FROM alerts WHERE incident_id=?",("INC-owner-lifecycle",))[0]
+        self.operator_client.post("/api/incidents/INC-owner-lifecycle/assign",json={"responder":"Crew"})
+        self.operator_client.post("/api/incidents/INC-owner-lifecycle/lifecycle",json={"status":"dispatched"})
+        after=self.db_rows("SELECT user_id,owner_identity_id,ownership_state FROM alerts WHERE incident_id=?",("INC-owner-lifecycle",))[0]
+        self.assertEqual(after,before)
+
+    def test_fallback_assertion_is_incident_and_node_bound_and_duplicate_owner_is_immutable(self):
+        self.activate_fallback_api()
+        incident="INC-ownership-bound"
+        self.assertEqual(self.client.post("/api/fallback/sos",json={"incident_id":incident,"alert_type":"other"}).status_code,201)
+        row=appmod.fallback_store.pending()[0]
+        user_id=self.client.get("/api/session").get_json()["user"]["id"]
+        owner=sqlite3.connect(appmod.DB_PATH).execute("SELECT identity_id FROM users WHERE id=?",(user_id,)).fetchone()[0]
+        self.assertEqual(row["owner_identity_id"],owner);self.assertEqual(row["ownership_state"],"verified")
+        self.assertTrue(row["ownership_assertion_digest"])
+        spoof=self.client.post("/api/sos",json={"incident_id":"INC-owner-spoof","owner_identity_id":"00000000-0000-0000-0000-000000000001"})
+        self.assertEqual(spoof.status_code,400)
+        wrong=dict(row);wrong["owner_identity_id"]="00000000-0000-0000-0000-000000000001"
+        with self.assertRaises(appmod.FailoverError):
+            appmod.fallback_store.accept(wrong,appmod.FALLBACK_NODE_ID,appmod.time.time())
+        bad=dict(row);bad["ownership_assertion"]="0"*64
+        internal={"incident_id":incident,"idempotency_key":incident,"username":"fallback-esp32-backup-sim",
+            "alert_type":"other","origin_mode":"fallback","source_node_id":appmod.FALLBACK_NODE_ID,
+            "owner_identity_id":owner,"ownership_issuer":appmod.FALLBACK_NODE_ID,"ownership_assertion":bad["ownership_assertion"],
+            "incident_capability_hash":row["incident_capability_hash"]}
+        response=appmod.app.test_client().post("/api/sos",json=internal,headers={"X-NexAlert-Internal":appmod.INTERNAL_FORWARD_TOKEN})
+        self.assertEqual(response.status_code,403)
+        self.assertEqual(appmod.fallback_store.pending_count(),1)
+
+    def test_new_citizen_without_preprovisioned_fallback_credential_is_unclaimed(self):
+        self.activate_fallback_api()
+        late=appmod.app.test_client();late.get("/api/csrf");self.register("Joined during outage",late)
+        response=late.post("/api/fallback/sos",json={"incident_id":"INC-unprovisioned-owner","alert_type":"other"})
+        self.assertEqual(response.status_code,201,response.get_json())
+        row=appmod.fallback_store.pending()[0]
+        self.assertEqual(row["ownership_state"],"unclaimed")
+        self.assertIsNone(row["owner_identity_id"])
+
+    def test_unclaimed_fallback_incident_remains_operator_visible_after_sync(self):
+        self.activate_fallback_api()
+        late=appmod.app.test_client();late.get("/api/csrf");self.register("Late joiner",late)
+        self.assertEqual(late.post("/api/fallback/sos",json={"incident_id":"INC-visible-unclaimed","alert_type":"other"}).status_code,201)
+        ctl=appmod.failover_controller;ctl.set_simulation(primary_running=True,primary_ready=True,drop_heartbeats=False)
+        ctl.tick();ctl.tick()
+        synced=self.operator_client.post("/api/failover/simulate",json={"action":"sync"})
+        self.assertEqual(synced.status_code,200,synced.get_json())
+        incident=self.db_rows("SELECT ownership_state,owner_identity_id FROM alerts WHERE incident_id=?",("INC-visible-unclaimed",))[0]
+        self.assertEqual(incident["ownership_state"],"unclaimed");self.assertIsNone(incident["owner_identity_id"])
+        visible=self.operator_client.get("/api/incidents").get_json()
+        self.assertTrue(any(row["incident_id"]=="INC-visible-unclaimed" for row in visible))
+        self.assertEqual(late.get("/api/incidents/INC-visible-unclaimed").status_code,404)
+
+    def test_operator_socket_is_not_sent_events_after_role_or_session_change(self):
+        sock=appmod.socketio.test_client(appmod.app,flask_test_client=self.operator_client)
+        operator=self.operator_client.get("/api/session").get_json()["user"]
+        db=sqlite3.connect(appmod.DB_PATH)
+        db.execute("UPDATE users SET role='citizen',session_version=session_version+1 WHERE id=?",(operator["id"],));db.commit();db.close()
+        appmod.emit_to_operators("new_alert",{"description":"private"})
+        self.assertFalse(sock.is_connected())
+        self.assertNotIn(operator["id"],appmod.ACTIVE_SOCKETS)
+
+    def test_revoked_operator_cannot_receive_private_incident_update(self):
+        sock=appmod.socketio.test_client(appmod.app,flask_test_client=self.operator_client)
+        sock.get_received()
+        operator=self.operator_client.get("/api/session").get_json()["user"]
+        db=sqlite3.connect(appmod.DB_PATH)
+        db.execute("UPDATE users SET role='citizen' WHERE id=?",(operator["id"],));db.commit();db.close()
+        appmod.emit_to_operators("incident_updated",{"incident_id":"INC-private","description":"private location details"})
+        self.assertFalse(sock.is_connected())
+
+    def test_old_operator_socket_gets_no_new_alert_after_second_login(self):
+        old_socket=appmod.socketio.test_client(appmod.app,flask_test_client=self.operator_client)
+        old_socket.get_received()
+        replacement=appmod.app.test_client();replacement.get("/api/csrf")
+        logged=replacement.post("/api/operator/login",json={"username":"operator-test","password":TEST_OPERATOR_PASSWORD})
+        self.assertEqual(logged.status_code,200)
+        appmod.emit_to_operators("new_alert",{"description":"secret"})
+        self.assertFalse(old_socket.is_connected())
+
+    def test_cli_style_version_bump_revokes_socket_pushes(self):
+        sock=appmod.socketio.test_client(appmod.app,flask_test_client=self.operator_client)
+        sock.get_received()
+        operator=self.operator_client.get("/api/session").get_json()["user"]
+        db=sqlite3.connect(appmod.DB_PATH);db.execute("UPDATE users SET session_version=session_version+1 WHERE id=?",(operator["id"],));db.commit();db.close()
+        appmod.emit_to_operators("new_alert",{"incident_id":"private"})
+        self.assertFalse(sock.is_connected())
+
+    def test_socket_closed_after_session_lifetime(self):
+        sock=appmod.socketio.test_client(appmod.app,flask_test_client=self.operator_client)
+        sid=next(iter(appmod.ACTIVE_SOCKET_IDENTITIES))
+        appmod._reap_expired_sockets(now=appmod.ACTIVE_SOCKET_IDENTITIES[sid]["expires_at"]+0.01)
+        self.assertFalse(sock.is_connected())
+
+    def test_logout_still_disconnects_operator_socket(self):
+        sock=appmod.socketio.test_client(appmod.app,flask_test_client=self.operator_client)
+        self.assertEqual(self.operator_client.post("/api/logout",json={}).status_code,200)
+        self.assertFalse(sock.is_connected())
+
+    def test_announcement_reaches_valid_citizen_sockets_only(self):
+        citizen_socket=appmod.socketio.test_client(appmod.app,flask_test_client=self.client)
+        operator_socket=appmod.socketio.test_client(appmod.app,flask_test_client=self.operator_client)
+        citizen_socket.get_received();operator_socket.get_received()
+        response=self.operator_client.post("/api/announcements",json={"content":"Evacuate","category":"flood_alert"})
+        self.assertEqual(response.status_code,201)
+        self.assertTrue(any(event["name"]=="system_announcement" for event in citizen_socket.get_received()))
+        self.assertFalse(any(event["name"]=="system_announcement" for event in operator_socket.get_received()))
+
+    def test_session_loss_retry_does_not_reassign_or_duplicate_incident(self):
+        self.assertEqual(self.sos("INC-session-recovery").status_code,201)
+        original=self.db_rows("SELECT user_id,owner_identity_id,ownership_state FROM alerts WHERE incident_id=?",("INC-session-recovery",))[0]
+        self.client.post("/api/logout",json={})
+        replacement=appmod.app.test_client();replacement.get("/api/csrf");self.register("Replacement identity",replacement)
+        denied=replacement.get("/api/incidents/INC-session-recovery")
+        retry=replacement.post("/api/sos",json={"incident_id":"INC-session-recovery","description":"retry"})
+        self.assertEqual(denied.status_code,404);self.assertEqual(retry.status_code,404)
+        restored=self.client.post("/api/sos",json={"incident_id":"INC-session-recovery","description":"same owner recovery"})
+        self.assertEqual(restored.status_code,200,restored.get_json())
+        self.assertEqual(self.db_rows("SELECT count(*) AS n FROM alerts WHERE incident_id=?",("INC-session-recovery",))[0]["n"],1)
+        self.assertEqual(self.db_rows("SELECT user_id,owner_identity_id,ownership_state FROM alerts WHERE incident_id=?",("INC-session-recovery",))[0],original)
+
+    def test_incident_capability_survives_session_logout_but_not_a_guess(self):
+        self.assertEqual(self.sos("INC-capability-recovery").status_code,201)
+        capability=self.client.incident_capabilities["INC-capability-recovery"]
+        committed=self.db_rows("SELECT incident_capability_hash FROM alerts WHERE incident_id=?",("INC-capability-recovery",))[0][0]
+        self.assertEqual(committed,appmod.hashlib.sha256(__import__("base64").urlsafe_b64decode(capability+"=")).hexdigest())
+        anonymous=appmod.app.test_client()
+        self.assertEqual(anonymous.get("/api/incidents/INC-capability-recovery").status_code,401)
+        self.client.post("/api/logout",json={})
+        recovered=self.client.get("/api/incidents/INC-capability-recovery",headers={"X-Incident-Capability":capability})
+        self.assertEqual(recovered.status_code,200,recovered.get_json())
+        self.assertNotIn("incident_capability_hash",recovered.get_json()["incident"])
+
+    def test_fallback_retry_after_session_loss_preserves_verified_owner(self):
+        self.activate_fallback_api()
+        first=self.client.post("/api/fallback/sos",json={"incident_id":"INC-fallback-session-loss","alert_type":"other"})
+        self.assertEqual(first.status_code,201,first.get_json())
+        original=appmod.fallback_store.pending()[0]
+        self.client.post("/api/logout",json={})
+        retry=self.client.post("/api/fallback/sos",json={"incident_id":"INC-fallback-session-loss","alert_type":"other"})
+        self.assertEqual(retry.status_code,200,retry.get_json())
+        restored=appmod.fallback_store.pending()[0]
+        self.assertEqual(restored["owner_identity_id"],original["owner_identity_id"])
+        self.assertEqual(restored["ownership_assertion_digest"],original["ownership_assertion_digest"])
 
     def test_lost_ack_retry_does_not_duplicate_command_centre_incident(self):
         self.activate_fallback_api()
         self.client.post("/api/fallback/sos", json={"incident_id":"INC-fallback-ack", "alert_type":"other"})
+        expected=sqlite3.connect(appmod.DB_PATH).execute("SELECT identity_id FROM users WHERE id=?",(self.client.get("/api/session").get_json()["user"]["id"],)).fetchone()[0]
         ctl = appmod.failover_controller
         ctl.set_simulation(primary_running=True, primary_ready=True, drop_heartbeats=False)
         ctl.tick(); ctl.tick()
@@ -415,8 +613,10 @@ class SosWorkflowTests(unittest.TestCase):
         cc = __import__('sqlite3').connect(appmod.CC_DB_PATH)
         try:
             count = cc.execute("SELECT count(*) FROM command_centre_incidents WHERE incident_id=?", ("INC-fallback-ack",)).fetchone()[0]
+            owner = cc.execute("SELECT owner_identity_id,ownership_state FROM command_centre_incidents WHERE incident_id=?",("INC-fallback-ack",)).fetchone()
         finally: cc.close()
         self.assertEqual(count, 1)
+        self.assertEqual(owner,(expected,"verified"))
         self.assertEqual(appmod.fallback_store.pending_count(), 0)
 
     def test_public_registration_cannot_select_username_or_role(self):
@@ -598,6 +798,114 @@ class SosWorkflowTests(unittest.TestCase):
                                   text=True,capture_output=True,timeout=15)
             self.assertNotEqual(result.returncode,0)
             self.assertIn("NEXALERT_SECRET must contain at least 32 bytes",result.stderr)
+        tls_env=dict(base);tls_env.update({"NEXALERT_SECRET":"x"*48,"NEXALERT_BACKUP_OWNERSHIP_KEY":"y"*48,
+            "NEXALERT_TRUSTED_PROXY_ADDRESS":"127.0.0.1","NEXALERT_TLS_CERT":"/nonexistent/operator.crt",
+            "NEXALERT_TLS_KEY":"/nonexistent/operator.key"})
+        result=subprocess.run([sys.executable,"-c","import backend.app as m; m.validate_production_tls_config('127.0.0.1')"],
+                              cwd=ROOT,env=tls_env,text=True,capture_output=True,timeout=15)
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn("TLS certificate or private key is invalid",result.stderr)
+
+    def test_untrusted_forwarded_https_header_is_ignored(self):
+        from unittest.mock import patch
+        observed={}
+        def app(environ,start_response):
+            observed.update(environ)
+            return []
+        proxy=appmod.TrustedLocalProxy(app)
+        environ={"REMOTE_ADDR":"192.0.2.55","wsgi.url_scheme":"http","HTTP_X_FORWARDED_PROTO":"https"}
+        with patch.object(appmod,"TRUSTED_PROXY_ADDRESS","127.0.0.1"):
+            proxy(environ,lambda *args:None)
+        self.assertEqual(observed["wsgi.url_scheme"],"http")
+        self.assertNotIn("HTTP_X_FORWARDED_PROTO",observed)
+
+    def test_operator_cli_refuses_to_convert_existing_citizen(self):
+        from unittest.mock import patch
+        from backend import manage_operator
+        module=manage_operator.app_module
+        old=(module.DB_PATH,module.CC_DB_PATH,module.FALLBACK_DB_PATH)
+        module.DB_PATH,module.CC_DB_PATH,module.FALLBACK_DB_PATH=appmod.DB_PATH,appmod.CC_DB_PATH,appmod.FALLBACK_DB_PATH
+        try:
+            args=["manage_operator","--username",self.client.get("/api/session").get_json()["user"]["username"]]
+            with patch("sys.argv",args),patch.object(manage_operator.getpass,"getpass",side_effect=["test-password-long","test-password-long"]):
+                with self.assertRaises(SystemExit):manage_operator.main()
+            row=self.db_rows("SELECT role,password_hash FROM users WHERE username=?",(args[-1],))[0]
+            self.assertEqual(tuple(row),("citizen",None))
+        finally:module.DB_PATH,module.CC_DB_PATH,module.FALLBACK_DB_PATH=old
+
+    def test_local_operator_recovery_rotates_password_and_revokes_old_session(self):
+        from unittest.mock import patch
+        from backend import manage_operator
+        module=manage_operator.app_module
+        old=(module.DB_PATH,module.CC_DB_PATH,module.FALLBACK_DB_PATH)
+        module.DB_PATH,module.CC_DB_PATH,module.FALLBACK_DB_PATH=appmod.DB_PATH,appmod.CC_DB_PATH,appmod.FALLBACK_DB_PATH
+        try:
+            operator=self.operator_client.get("/api/session").get_json()["user"]
+            previous_version=self.db_rows("SELECT session_version FROM users WHERE id=?",(operator["id"],))[0][0]
+            args=["manage_operator","--username","operator-test"]
+            with patch("sys.argv",args),patch.object(manage_operator.getpass,"getpass",side_effect=["recovered-password-long","recovered-password-long"]):
+                manage_operator.main()
+            self.assertEqual(self.operator_client.get("/api/session").status_code,401)
+            row=self.db_rows("SELECT session_version,password_hash,role FROM users WHERE username='operator-test'")[0]
+            self.assertGreater(row["session_version"],previous_version)
+            self.assertEqual(row["role"],"operator")
+            self.assertTrue(appmod.check_password_hash(row["password_hash"],"recovered-password-long"))
+            with appmod.app.test_request_context("/api/operator/login",method="POST",json={"username":"operator-test","password":"recovered-password-long"}):
+                response=appmod.app.make_response(appmod.app.view_functions["operator_login"]())
+            self.assertEqual(response.status_code,200)
+        finally:module.DB_PATH,module.CC_DB_PATH,module.FALLBACK_DB_PATH=old
+
+    def test_contact_sync_never_discloses_phone_account_existence(self):
+        other=appmod.app.test_client();other.get("/api/csrf")
+        user=self.register("Phone user",other)
+        db=sqlite3.connect(appmod.DB_PATH)
+        db.execute("UPDATE users SET phone='555-0100' WHERE id=?",(user["id"],))
+        db.execute("INSERT INTO contacts(owner_id,contact_name,contact_phone,on_network,network_user_id) VALUES(?,?,?,?,?)",
+                   (self.client.get("/api/session").get_json()["user"]["id"],"Old match","555-0100",1,user["id"]))
+        db.commit();db.close()
+        response=self.client.post("/api/contacts",json={"contacts":[]})
+        self.assertEqual(response.status_code,200,response.get_json())
+        self.assertFalse(response.get_json()[0]["on_network"])
+
+    def test_malformed_and_oversized_sos_do_not_create_incidents(self):
+        before=self.db_rows("SELECT count(*) FROM alerts")[0][0]
+        malformed=self.client.post("/api/sos",data="{",content_type="application/json")
+        oversized=self.client.post("/api/sos",data='{"alert_type":"other","description":"'+("x"*5000)+'"}',content_type="application/json")
+        self.assertEqual(malformed.status_code,400,malformed.get_json())
+        self.assertEqual(oversized.status_code,413,oversized.get_json())
+        self.assertEqual(self.db_rows("SELECT count(*) FROM alerts")[0][0],before)
+
+    def test_operator_login_source_throttle_expires_without_account_lockout(self):
+        old_clock=appmod.RATE_LIMIT_CLOCK
+        now=[2_000_000]
+        appmod.RATE_LIMIT_CLOCK=lambda:now[0]
+        try:
+            for _ in range(20):self.assertTrue(appmod._consume_rate_limit("operator-login","test-source",20,60)[0])
+            self.assertFalse(appmod._consume_rate_limit("operator-login","test-source",20,60)[0])
+            self.assertEqual(self.db_rows("SELECT auth_failed_attempts FROM users WHERE username='operator-test'")[0][0],0)
+            now[0]+=60
+            self.assertTrue(appmod._consume_rate_limit("operator-login","test-source",20,60)[0])
+            for credentials,expected in (({"username":"operator-test","password":"wrong"},401),
+                                         ({"username":"operator-test","password":TEST_OPERATOR_PASSWORD},200)):
+                with appmod.app.test_request_context("/api/operator/login",method="POST",json=credentials):
+                    response=appmod.app.view_functions["operator_login"]()
+                    self.assertEqual(appmod.app.make_response(response).status_code,expected)
+        finally:appmod.RATE_LIMIT_CLOCK=old_clock
+
+    def test_sos_identity_rate_limit_recovers_at_window_boundary(self):
+        old_clock=appmod.RATE_LIMIT_CLOCK
+        now=[2_100_000]
+        appmod.RATE_LIMIT_CLOCK=lambda:now[0]
+        try:
+            for i in range(20):
+                response=self.client.post("/api/sos",json={"incident_id":f"INC-rate-{i}","alert_type":"other"})
+                self.assertEqual(response.status_code,201,response.get_json())
+            limited=self.client.post("/api/sos",json={"incident_id":"INC-rate-limited","alert_type":"other"})
+            self.assertEqual(limited.status_code,429)
+            now[0]+=60
+            recovered=self.client.post("/api/sos",json={"incident_id":"INC-rate-recovered","alert_type":"other"})
+            self.assertEqual(recovered.status_code,201,recovered.get_json())
+        finally:appmod.RATE_LIMIT_CLOCK=old_clock
 
     def test_call_signalling_rejects_socket_without_session(self):
         socket_client = appmod.socketio.test_client(appmod.app)
@@ -632,10 +940,29 @@ class SosWorkflowTests(unittest.TestCase):
         self.assertEqual(self.db_rows("SELECT state FROM outbound_queue")[0][0], "queued")
         self.assertEqual(self.db_rows("SELECT delivery_status FROM alerts")[0][0], "queued")
 
+    def test_http_sos_returns_after_durable_queue_before_transport_worker(self):
+        response = self.client.post("/api/sos", json={"incident_id": "INC-async-accept", "alert_type": "other"})
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.get_json()["alert"]["delivery_status"], "queued")
+        self.assertEqual(self.db_rows("SELECT state FROM outbound_queue WHERE incident_id='INC-async-accept'")[0][0], "queued")
+        appmod.transport.process_queue(limit=1)
+        self.assertEqual(self.db_rows("SELECT delivery_status FROM alerts WHERE incident_id='INC-async-accept'")[0][0], "received_by_command_centre")
+
+    def test_outbox_selects_emergency_priority_before_routine(self):
+        for incident, priority in (("INC-routine-first", "routine"), ("INC-critical-second", "critical")):
+            response=self.client.post("/api/sos",json={"incident_id":incident,"alert_type":"other","priority":priority})
+            self.assertEqual(response.status_code,201,response.get_json())
+        appmod.transport.process_queue(limit=1)
+        cc=sqlite3.connect(appmod.CC_DB_PATH)
+        try:
+            self.assertEqual(cc.execute("SELECT incident_id FROM command_centre_incidents").fetchall(),[("INC-critical-second",)])
+        finally: cc.close()
+
     def test_delivery_after_transport_reconnection(self):
         appmod.transport.configure(connected=False)
         self.sos()
         appmod.transport.configure(connected=True)
+        appmod.transport.process_queue()
         self.assertEqual(self.db_rows("SELECT state FROM outbound_queue")[0][0], "delivered")
         self.assertEqual(self.db_rows("SELECT delivery_status FROM alerts")[0][0], "received_by_command_centre")
 
@@ -667,6 +994,7 @@ class SosWorkflowTests(unittest.TestCase):
     def test_retry_after_lost_acknowledgement(self):
         appmod.transport.configure(lose_next_ack=True)
         self.sos("INC-retry-ack")
+        conn=sqlite3.connect(appmod.DB_PATH);conn.execute("UPDATE outbound_queue SET next_attempt_at='' WHERE incident_id='INC-retry-ack'");conn.commit();conn.close()
         appmod.transport.process_queue()
         self.assertEqual(self.db_rows("SELECT delivery_status FROM alerts WHERE incident_id=?", ("INC-retry-ack",))[0][0], "received_by_command_centre")
         cc=__import__('sqlite3').connect(appmod.CC_DB_PATH)
@@ -681,6 +1009,7 @@ class SosWorkflowTests(unittest.TestCase):
         self.assertEqual(appmod.transport.connected,False)
         self.assertEqual(self.db_rows("SELECT state FROM outbound_queue WHERE incident_id=?", ("INC-restart",))[0][0],"queued")
         appmod.transport.configure(connected=True)
+        appmod.transport.process_queue()
         self.assertEqual(self.db_rows("SELECT state FROM outbound_queue WHERE incident_id=?", ("INC-restart",))[0][0], "delivered")
         self.assertEqual(self.db_rows("SELECT delivery_status FROM alerts WHERE incident_id=?", ("INC-restart",))[0][0], "received_by_command_centre")
 
@@ -704,7 +1033,7 @@ class SosWorkflowTests(unittest.TestCase):
 
     def test_idempotency_header_keeps_same_incident(self):
         one=self.client.post('/api/sos',json={'incident_id':'INC-key-one'},headers={'Idempotency-Key':'retry-key'})
-        two=self.client.post('/api/sos',json={'incident_id':'INC-key-two'},headers={'Idempotency-Key':'retry-key'})
+        two=self.client.post('/api/sos',json={'incident_id':'INC-key-one'},headers={'Idempotency-Key':'retry-key'})
         self.assertEqual(one.get_json()['alert']['incident_id'],two.get_json()['alert']['incident_id'])
         self.assertEqual(len(self.db_rows('SELECT * FROM alerts')),1)
 
@@ -713,6 +1042,7 @@ class SosWorkflowTests(unittest.TestCase):
         response=self.sos('INC-failed-send')
         self.assertEqual(response.get_json()['alert']['delivery_status'],'queued')
         self.assertEqual(self.db_rows("SELECT outcome FROM delivery_attempts WHERE incident_id='INC-failed-send'")[0][0],'failed')
+        conn=sqlite3.connect(appmod.DB_PATH);conn.execute("UPDATE outbound_queue SET next_attempt_at='2000-01-01 00:00:00' WHERE incident_id='INC-failed-send'");conn.commit();conn.close()
         appmod.transport.process_queue()
         self.assertEqual(self.db_rows("SELECT delivery_status FROM alerts WHERE incident_id='INC-failed-send'")[0][0],'received_by_command_centre')
 

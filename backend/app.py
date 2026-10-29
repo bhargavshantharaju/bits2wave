@@ -19,6 +19,10 @@ import os
 import sqlite3
 import time
 import logging
+import hashlib
+import hmac
+import ipaddress
+import ssl
 import re
 import uuid
 import secrets
@@ -26,16 +30,16 @@ from functools import wraps
 from datetime import datetime, timedelta
 from time import monotonic
 from flask import Flask, request, jsonify, render_template, g, session, send_from_directory, redirect
+from werkzeug.exceptions import BadRequest, RequestEntityTooLarge
 from flask_socketio import SocketIO, emit, join_room, leave_room
 from werkzeug.security import check_password_hash, generate_password_hash
-from werkzeug.middleware.proxy_fix import ProxyFix
 try:
     from backend.migrations import migrate_sos_schema, migrate_security_schema
-    from backend.failover import FailoverController, FailoverError, FailoverState, FallbackStore, FallbackSynchronizer, ForwardResult, Heartbeat
+    from backend.failover import FailoverController, FailoverError, FailoverState, FallbackStore, FallbackSynchronizer, ForwardResult, Heartbeat, sign_ownership_assertion, verify_ownership_assertion
     from backend.transport import SosTransport
 except ModuleNotFoundError:  # Running as `python backend/app.py`
     from migrations import migrate_sos_schema, migrate_security_schema
-    from failover import FailoverController, FailoverError, FailoverState, FallbackStore, FallbackSynchronizer, ForwardResult, Heartbeat
+    from failover import FailoverController, FailoverError, FailoverState, FallbackStore, FallbackSynchronizer, ForwardResult, Heartbeat, sign_ownership_assertion, verify_ownership_assertion
     from transport import SosTransport
 
 # ── App setup ─────────────────────────────────────────────────────────────────
@@ -64,6 +68,16 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__,
             template_folder=os.path.join(BASE_DIR, "templates"),
             static_folder=os.path.join(BASE_DIR, "static"))
+
+
+@app.errorhandler(RequestEntityTooLarge)
+def request_too_large(_error):
+    return jsonify({"error": "request body is too large"}), 413
+
+
+@app.errorhandler(BadRequest)
+def malformed_request(_error):
+    return jsonify({"error": "malformed request"}), 400
 APP_STARTED_MONOTONIC = monotonic()
 APP_ENV = os.environ.get("NEXALERT_ENV", "production").lower()
 IS_DEVELOPMENT = APP_ENV in {"dev", "development", "test"}
@@ -79,23 +93,94 @@ app.config.update(
     SESSION_COOKIE_NAME="nexalert_session",
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
-    SESSION_COOKIE_SECURE=os.environ.get("NEXALERT_HTTPS", "0") == "1",
+    SESSION_COOKIE_SECURE=not IS_DEVELOPMENT,
     PERMANENT_SESSION_LIFETIME=timedelta(hours=8),
     SESSION_REFRESH_EACH_REQUEST=False,
+    MAX_CONTENT_LENGTH=64 * 1024,
 )
 app.config["TESTING"] = APP_ENV == "test"
 app.config["ENV"] = APP_ENV
-if not IS_DEVELOPMENT and os.environ.get("NEXALERT_TRUST_PROXY") == "1":
-    app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1)
-OPERATOR_HTTPS_ENABLED = IS_DEVELOPMENT or os.environ.get("NEXALERT_HTTPS") == "1"
+if os.environ.get("NEXALERT_TRUST_PROXY"):
+    raise RuntimeError("NEXALERT_TRUST_PROXY is unsafe and unsupported; configure the explicit trusted-proxy settings")
+OPERATOR_HTTPS_ENABLED = IS_DEVELOPMENT or bool(os.environ.get("NEXALERT_TLS_CERT") and os.environ.get("NEXALERT_TLS_KEY"))
+TRUSTED_PROXY_ADDRESS = os.environ.get("NEXALERT_TRUSTED_PROXY_ADDRESS", "")
+TLS_CERT_PATH = os.environ.get("NEXALERT_TLS_CERT", "")
+TLS_KEY_PATH = os.environ.get("NEXALERT_TLS_KEY", "")
 INTERNAL_FORWARD_TOKEN = uuid.uuid4().hex
+PRIMARY_NODE_ID = os.environ.get("NEXALERT_PRIMARY_NODE_ID","pi5-primary")
+FALLBACK_NODE_ID = os.environ.get("NEXALERT_FALLBACK_NODE_ID","esp32-backup-sim")
+# One key per configured fallback node, installed on that backup and this primary.
+# It is distinct from Flask's session signing secret.
+OWNERSHIP_ASSERTION_KEY = os.environ.get("NEXALERT_BACKUP_OWNERSHIP_KEY",
+    "").encode()
+if not IS_DEVELOPMENT and len(OWNERSHIP_ASSERTION_KEY) < 32:
+    raise RuntimeError("production requires a unique NEXALERT_BACKUP_OWNERSHIP_KEY of at least 32 bytes")
+if IS_DEVELOPMENT and not OWNERSHIP_ASSERTION_KEY:
+    OWNERSHIP_ASSERTION_KEY = secrets.token_bytes(32)
 DUMMY_PASSWORD_HASH = generate_password_hash(secrets.token_urlsafe(32), method="scrypt")
 ACTIVE_SOCKETS = {}
+ACTIVE_SOCKET_IDENTITIES = {}
+SOCKET_REAPER_STARTED = False
+SOCKET_CLOCK = time.time
+RATE_LIMIT_CLOCK = time.time
 
 # BUG FIX #1: Use threading mode — eventlet requires monkey-patching at module
 # top-level which breaks Pi GPIO libs and conflicts with BalenaOS containers.
 socketio = SocketIO(app, async_mode="threading", cors_allowed_origins=None,
                     logger=False, engineio_logger=False)
+
+
+class TrustedLocalProxy:
+    """Honor proxy scheme/client IP only from the configured loopback proxy."""
+    def __init__(self, wsgi_app):
+        self.wsgi_app = wsgi_app
+
+    def __call__(self, environ, start_response):
+        remote = environ.get("REMOTE_ADDR", "")
+        if TRUSTED_PROXY_ADDRESS and remote == TRUSTED_PROXY_ADDRESS:
+            proto = environ.pop("HTTP_X_FORWARDED_PROTO", "")
+            client = environ.pop("HTTP_X_REAL_IP", "")
+            if proto == "https":
+                environ["wsgi.url_scheme"] = "https"
+            try:
+                ipaddress.ip_address(client)
+                environ["REMOTE_ADDR"] = client
+            except ValueError:
+                pass
+        else:
+            environ.pop("HTTP_X_FORWARDED_PROTO", None)
+            environ.pop("HTTP_X_REAL_IP", None)
+        return self.wsgi_app(environ, start_response)
+
+
+app.wsgi_app = TrustedLocalProxy(app.wsgi_app)
+
+
+def validate_production_tls_config(host=None):
+    if IS_DEVELOPMENT:
+        return
+    if not TLS_CERT_PATH or not TLS_KEY_PATH:
+        raise RuntimeError("production requires NEXALERT_TLS_CERT and NEXALERT_TLS_KEY")
+    if not TRUSTED_PROXY_ADDRESS:
+        raise RuntimeError("production requires NEXALERT_TRUSTED_PROXY_ADDRESS for the local TLS proxy")
+    try:
+        address = ipaddress.ip_address(TRUSTED_PROXY_ADDRESS)
+    except ValueError as exc:
+        raise RuntimeError("trusted TLS proxy must be a literal loopback IP address") from exc
+    if not address.is_loopback:
+        raise RuntimeError("trusted TLS proxy address must be loopback; remote proxy trust is unsupported")
+    if host is not None:
+        try:
+            bind_address = ipaddress.ip_address(host)
+        except ValueError as exc:
+            raise RuntimeError("production app bind host must be a literal loopback IP behind the TLS proxy") from exc
+        if not bind_address.is_loopback:
+            raise RuntimeError("production app must bind loopback behind the TLS proxy")
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    try:
+        context.load_cert_chain(TLS_CERT_PATH, TLS_KEY_PATH)
+    except (OSError, ssl.SSLError) as exc:
+        raise RuntimeError("production TLS certificate or private key is invalid") from exc
 
 # ── Alert type registry ───────────────────────────────────────────────────────
 ALERT_TYPES = {
@@ -132,6 +217,80 @@ def open_db_connection():
     return conn
 
 
+def incident_capability_hash(value):
+    """Return a digest only for a syntactically valid 256-bit bearer capability."""
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_-]{43}", value):
+        return None
+    try:
+        decoded = __import__("base64").urlsafe_b64decode(value + "=")
+    except Exception:
+        return None
+    if len(decoded) != 32:
+        return None
+    return hashlib.sha256(decoded).hexdigest()
+
+
+def _source_hash():
+    address = request.remote_addr or "unknown"
+    return hmac.new(app.secret_key.encode(), address.encode(), hashlib.sha256).hexdigest()
+
+
+def record_security_event(event, outcome, actor_id=None, detail=""):
+    try:
+        db = open_db_connection()
+        db.execute("INSERT INTO security_events(actor_id,event,outcome,source_hash,detail) VALUES(?,?,?,?,?)",
+                   (actor_id, event, outcome, _source_hash(), str(detail)[:200]))
+        db.commit(); db.close()
+    except sqlite3.Error:
+        logger.warning("security event persistence failed event=%s", event)
+
+
+def _consume_rate_limit(scope, key, limit, window_seconds):
+    now = int(RATE_LIMIT_CLOCK())
+    bucket = now - (now % window_seconds)
+    key_hash = hmac.new(app.secret_key.encode(), str(key).encode(), hashlib.sha256).hexdigest()
+    db = open_db_connection()
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        db.execute("INSERT INTO request_rate_limits(scope,key_hash,window_start,hits) VALUES(?,?,?,1) "
+                   "ON CONFLICT(scope,key_hash,window_start) DO UPDATE SET hits=hits+1",
+                   (scope, key_hash, bucket))
+        hits = db.execute("SELECT hits FROM request_rate_limits WHERE scope=? AND key_hash=? AND window_start=?",
+                          (scope, key_hash, bucket)).fetchone()[0]
+        if now % 100 < 2:
+            db.execute("DELETE FROM request_rate_limits WHERE window_start<?", (now - 7 * 86400,))
+        db.commit()
+        return hits <= limit, max(1, bucket + window_seconds - now)
+    finally:
+        db.close()
+
+
+def _rate_limit_request():
+    endpoint = request.endpoint
+    policy = {
+        "register": (("registration", 30, 3600, "ip"),),
+        "create_sos": (("sos-ip", 300, 60, "ip"), ("sos-identity", 20, 60, "identity")),
+        "fallback_sos": (("fallback-sos-ip", 300, 60, "ip"), ("fallback-sos-identity", 20, 60, "identity")),
+        "operator_login": (("operator-login", 20, 60, "ip"),),
+        "create_announcement": (("announcement-ip", 20, 300, "ip"), ("announcement-identity", 10, 300, "identity")),
+        "send_message": (("message", 60, 60, "identity"),),
+        "create_group": (("group", 10, 60, "identity"),),
+        "sync_contacts": (("contacts", 30, 60, "identity"),),
+        "post_environmental": (("environmental", 120, 60, "identity"),),
+    }.get(endpoint, ())
+    identity = authenticated_user() if any(item[3] == "identity" for item in policy) else None
+    for scope, limit, window, basis in policy:
+        key = (request.remote_addr or "unknown") if basis == "ip" else (
+            str(identity["identity_id"]) if identity else (request.remote_addr or "unknown"))
+        allowed, retry = _consume_rate_limit(scope, key, limit, window)
+        if not allowed:
+            response = jsonify({"error": "request rate limit exceeded; retry later"})
+            response.status_code = 429
+            response.headers["Retry-After"] = str(retry)
+            return response
+    return None
+
+
 def record_incident_event(conn, incident_id, status, detail=""):
     conn.execute(
         "INSERT INTO incident_events (incident_id, status, detail) VALUES (?, ?, ?)",
@@ -152,12 +311,14 @@ def persist_command_centre_incident(receiver, report):
     receiver.execute(
         "INSERT OR IGNORE INTO command_centre_incidents "
         "(incident_id,user_id,alert_type,description,latitude,longitude,reported_at,"
-        "landmark,source_node_id,origin_mode) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        "landmark,source_node_id,origin_mode,owner_identity_id,ownership_state,ownership_issuer,ownership_assertion_digest,priority,incident_capability_hash) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (incident_id, report.get("user_id"), report["alert_type"],
          report.get("description", ""), report.get("latitude"), report.get("longitude"),
          report.get("timestamp") or report.get("reported_at") or datetime.now().isoformat(),
          report.get("landmark", ""), report.get("source_node_id"),
-         report.get("origin_mode", "primary")),
+         report.get("origin_mode", "primary"),report.get("owner_identity_id"),
+         report.get("ownership_state","legacy_unverified"),report.get("ownership_issuer"),
+         report.get("ownership_assertion_digest"),report.get("priority","high"),report.get("incident_capability_hash")),
     )
     receiver.execute(
         "INSERT OR IGNORE INTO command_centre_receipts(incident_id,receipt_id) VALUES(?,?)",
@@ -232,8 +393,6 @@ class SimulatedTransport(SosTransport):
         conn=open_db_connection()
         conn.execute("INSERT INTO simulated_transport_config(singleton,connected,lose_next_ack,fail_next_transmission) VALUES(1,?,?,?) ON CONFLICT(singleton) DO UPDATE SET connected=excluded.connected,lose_next_ack=excluded.lose_next_ack,fail_next_transmission=excluded.fail_next_transmission",(int(self.connected),int(self.lose_next_ack),int(self.fail_next_transmission)))
         conn.commit(); conn.close()
-        if self.connected:
-            self.process_queue()
 
     def restore_controls(self):
         conn=open_db_connection()
@@ -242,7 +401,7 @@ class SimulatedTransport(SosTransport):
         if row:
             self.connected=bool(row[0]); self.lose_next_ack=bool(row[1]); self.fail_next_transmission=bool(row[2])
 
-    def process_queue(self):
+    def process_queue(self, limit=100):
         conn = open_db_connection()
         receiver = sqlite3.connect(CC_DB_PATH, check_same_thread=False)
         receiver.row_factory = sqlite3.Row
@@ -263,6 +422,13 @@ class SimulatedTransport(SosTransport):
             for column, declaration in (("source_node_id", "TEXT"), ("origin_mode", "TEXT NOT NULL DEFAULT 'primary'")):
                 if column not in receiver_cols:
                     receiver.execute(f"ALTER TABLE command_centre_incidents ADD COLUMN {column} {declaration}")
+            for column,declaration in (("owner_identity_id","TEXT"),("ownership_state","TEXT NOT NULL DEFAULT 'legacy_unverified'"),("ownership_issuer","TEXT"),("ownership_assertion_digest","TEXT")):
+                if column not in receiver_cols:
+                    receiver.execute(f"ALTER TABLE command_centre_incidents ADD COLUMN {column} {declaration}")
+            if "priority" not in receiver_cols:
+                receiver.execute("ALTER TABLE command_centre_incidents ADD COLUMN priority TEXT NOT NULL DEFAULT 'high'")
+            if "incident_capability_hash" not in receiver_cols:
+                receiver.execute("ALTER TABLE command_centre_incidents ADD COLUMN incident_capability_hash TEXT")
             # Earlier Phase 1 code kept a simulated destination table inside the
             # sender DB. Copy those already-persisted destination records once to
             # the separate receiver store and preserve the original receipt fact.
@@ -291,25 +457,28 @@ class SimulatedTransport(SosTransport):
             if not self.connected:
                 return 0
             pending = conn.execute(
-                "SELECT incident_id FROM outbound_queue WHERE state != 'delivered' ORDER BY id"
+                "SELECT incident_id FROM outbound_queue WHERE state IN ('queued','retry') "
+                "AND (next_attempt_at='' OR next_attempt_at<=datetime('now')) "
+                "ORDER BY priority DESC,id LIMIT ?", (max(1, min(int(limit), 500)),)
             ).fetchall()
             for row in pending:
                 incident_id = row["incident_id"]
                 if self.fail_next_transmission:
                     self.fail_next_transmission = False
-                    conn.execute("UPDATE outbound_queue SET attempts=attempts+1,last_attempt_at=datetime('now') WHERE incident_id=?",(incident_id,))
+                    conn.execute("UPDATE outbound_queue SET attempts=attempts+1,last_attempt_at=datetime('now'),state=CASE WHEN attempts+1>=max_attempts THEN 'failed' ELSE 'retry' END,next_attempt_at=datetime('now','+' || min(300,(1 << min(attempts+1,8))) || ' seconds'),failure_reason=CASE WHEN attempts+1>=max_attempts THEN 'retry limit reached' ELSE NULL END WHERE incident_id=?",(incident_id,))
                     conn.execute("INSERT INTO delivery_attempts(incident_id,outcome,detail) VALUES(?,'failed','simulated transmission failure')",(incident_id,))
                     conn.execute("UPDATE simulated_transport_config SET fail_next_transmission=0 WHERE singleton=1")
                     conn.commit()
                     continue
                 conn.execute(
                     "UPDATE outbound_queue SET state='queued', attempts=attempts+1, "
-                    "last_attempt_at=datetime('now') WHERE incident_id=?",
+                    "last_attempt_at=datetime('now'),next_attempt_at=datetime('now','+' || min(300,(1 << min(attempts+1,8))) || ' seconds'), "
+                    "failure_reason=CASE WHEN attempts+1>=max_attempts THEN 'retry limit reached' ELSE NULL END WHERE incident_id=?",
                     (incident_id,),
                 )
                 conn.execute("INSERT INTO delivery_attempts(incident_id,outcome,detail) VALUES(?,'attempted','simulated transport send')", (incident_id,))
                 alert = conn.execute(
-                    "SELECT incident_id, user_id, alert_type, description, latitude, longitude, timestamp, landmark, source_node_id, origin_mode "
+                    "SELECT incident_id, user_id, alert_type, description, latitude, longitude, timestamp, landmark, source_node_id, origin_mode,owner_identity_id,ownership_state,ownership_issuer,ownership_assertion_digest,priority,incident_capability_hash "
                     "FROM alerts WHERE incident_id=?", (incident_id,)
                 ).fetchone()
                 if not alert:
@@ -382,11 +551,14 @@ def authenticated_user():
         return g.security_identity
     user_id = session.get("user_id")
     session_version = session.get("session_version")
-    if isinstance(user_id, bool) or not isinstance(user_id, int) or not isinstance(session_version, int):
+    expires_at = session.get("session_expires_at")
+    if (isinstance(user_id, bool) or not isinstance(user_id, int) or
+        not isinstance(session_version, int) or not isinstance(expires_at, (int, float)) or
+        expires_at <= time.time()):
         g.security_identity = None
         return None
     user = get_db().execute(
-        "SELECT id,username,full_name,role,session_version FROM users WHERE id=?", (user_id,)
+        "SELECT id,identity_id,username,full_name,role,session_version FROM users WHERE id=?", (user_id,)
     ).fetchone()
     if user is None or user["session_version"] != session_version:
         session.clear()
@@ -400,6 +572,8 @@ def require_auth(*roles):
     def decorate(view):
         @wraps(view)
         def wrapped(*args, **kwargs):
+            if "operator" in roles and not IS_DEVELOPMENT and not request.is_secure:
+                return jsonify({"error": "operator access requires the configured HTTPS proxy"}), 503
             identity = authenticated_user()
             if identity is None:
                 return jsonify({"error": "authentication required"}), 401
@@ -414,11 +588,37 @@ def require_auth(*roles):
 def enforce_csrf_for_mutations():
     if request.method in {"GET", "HEAD", "OPTIONS"}:
         return None
+    if request.content_length is not None:
+        path_limits = {"/api/sos": 4096, "/api/fallback/sos": 4096,
+                       "/api/operator/login": 4096, "/api/announcements": 4096,
+                       "/api/messages": 4096, "/api/contacts": 16384}
+        if request.content_length > path_limits.get(request.path, 16384):
+            return jsonify({"error": "request body is too large"}), 413
+    if request.path.startswith("/api/") and request.get_data(cache=True):
+        if not request.is_json:
+            return jsonify({"error": "application/json content type required"}), 415
+        try:
+            parsed=request.get_json(silent=False)
+        except RequestEntityTooLarge:
+            return jsonify({"error":"request body is too large"}),413
+        except BadRequest:
+            return jsonify({"error": "malformed JSON request body"}), 400
+        except Exception:
+            return jsonify({"error": "malformed JSON request body"}), 400
+        if request.path in {"/api/sos", "/api/fallback/sos"} and not isinstance(parsed,dict):
+            return jsonify({"error":"request body must be a JSON object"}),400
+    limited = _rate_limit_request()
+    if limited is not None:
+        return limited
     endpoint = request.endpoint
     if endpoint == "receive_failover_heartbeat":
         return None  # The failover controller validates its signed heartbeat.
     if endpoint == "create_sos" and secrets.compare_digest(
         request.headers.get("X-NexAlert-Internal", ""), INTERNAL_FORWARD_TOKEN
+    ):
+        return None
+    if endpoint in {"create_sos", "fallback_sos", "incident_detail", "update_incident"} and incident_capability_hash(
+        request.headers.get("X-Incident-Capability", "")
     ):
         return None
     identity = authenticated_user()
@@ -434,6 +634,7 @@ def issue_session(identity):
     session.permanent = True
     session["user_id"] = identity["id"]
     session["session_version"] = identity["session_version"]
+    session["session_expires_at"] = time.time() + app.permanent_session_lifetime.total_seconds()
     session["csrf_token"] = secrets.token_urlsafe(32)
 
 
@@ -570,6 +771,31 @@ def init_db():
     migrate_security_schema(conn)
     conn.commit()
     conn.close()
+    # Keep the command-centre store independently initialised. It is not a
+    # view over the sender database and remains readable while the sender is
+    # stopped or unavailable.
+    receiver = sqlite3.connect(CC_DB_PATH)
+    receiver.execute("PRAGMA journal_mode=WAL")
+    receiver.executescript("""CREATE TABLE IF NOT EXISTS command_centre_incidents (
+        incident_id TEXT PRIMARY KEY,user_id INTEGER,alert_type TEXT NOT NULL,
+        description TEXT NOT NULL DEFAULT '',latitude REAL,longitude REAL,
+        landmark TEXT NOT NULL DEFAULT '',reported_at TEXT NOT NULL,
+        received_at TEXT NOT NULL DEFAULT(datetime('now')),
+        source_node_id TEXT,origin_mode TEXT NOT NULL DEFAULT 'primary',
+        owner_identity_id TEXT,ownership_state TEXT NOT NULL DEFAULT 'legacy_unverified',
+        ownership_issuer TEXT,ownership_assertion_digest TEXT,
+        priority TEXT NOT NULL DEFAULT 'high',incident_capability_hash TEXT);
+        CREATE TABLE IF NOT EXISTS command_centre_receipts (
+        incident_id TEXT PRIMARY KEY,receipt_id TEXT NOT NULL UNIQUE,
+        created_at TEXT NOT NULL DEFAULT(datetime('now')));
+        CREATE TABLE IF NOT EXISTS command_centre_events (
+        id INTEGER PRIMARY KEY,incident_id TEXT NOT NULL,status TEXT NOT NULL,
+        detail TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL DEFAULT(datetime('now')));
+        CREATE TABLE IF NOT EXISTS command_centre_operator_actions (
+        id INTEGER PRIMARY KEY,actor_id INTEGER NOT NULL,action TEXT NOT NULL,
+        incident_id TEXT,from_state TEXT,to_state TEXT,outcome TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT(datetime('now')));""")
+    receiver.close()
     logger.info("Database initialised at %s", DB_PATH)
     # On process start, reconcile receiver records even when disconnected and
     # only drain queued work when the persisted link setting is connected.
@@ -578,7 +804,8 @@ def init_db():
         restore_transport()
     # This also migrates any legacy command-centre rows while disconnected;
     # the simulated transport does not drain the queue unless connected.
-    transport.process_queue()
+    # Delivery is performed by the separately supervised outbox worker. Startup
+    # only restores transport controls; HTTP startup never drains the queue.
     global fallback_store, failover_controller, failover_simulation_enabled
     fallback_store = FallbackStore(FALLBACK_DB_PATH)
     failover_simulation_enabled = bool(app.testing or (
@@ -591,6 +818,15 @@ def init_db():
             simulate_primary=True)
     else:
         failover_controller = None
+    # The host simulation provisions identities only when the primary is known
+    # available. A separate physical node needs an authenticated transfer.
+    if failover_controller is None or failover_controller.state in {FailoverState.PRIMARY_ACTIVE,FailoverState.BACKUP_STANDBY}:
+        provision_db=sqlite3.connect(DB_PATH)
+        try:
+            for row in provision_db.execute("SELECT identity_id FROM users WHERE identity_id IS NOT NULL"):
+                fallback_store.provision_citizen(row[0])
+        finally:
+            provision_db.close()
 
 # ── REST API ──────────────────────────────────────────────────────────────────
 
@@ -614,12 +850,16 @@ def register():
     db = get_db()
     try:
         db.execute(
-            "INSERT INTO users (username, full_name, phone, role) VALUES (?, ?, '', 'citizen')",
-            (username, full_name)
+            "INSERT INTO users (identity_id,username, full_name, phone, role) VALUES (?, ?, ?, '', 'citizen')",
+            (str(uuid.uuid4()),username, full_name)
         )
         db.commit()
-        user = dict(db.execute("SELECT id,username,full_name,role,session_version FROM users WHERE username=?", (username,)).fetchone())
+        user = dict(db.execute("SELECT id,identity_id,username,full_name,role,session_version FROM users WHERE username=?", (username,)).fetchone())
         issue_session(user)
+        provisioning_state={FailoverState.PRIMARY_ACTIVE,FailoverState.BACKUP_STANDBY} if failover_controller else set()
+        if fallback_store is not None and (failover_controller is None or failover_controller.state in provisioning_state):
+            fallback_store.provision_citizen(user["identity_id"])
+        record_security_event("citizen_registration", "success", user["id"])
         return jsonify({"status":"ok","user":public_identity(user),"csrf_token":session["csrf_token"]}),201
     except Exception as e:
         logger.error("citizen onboarding failed (%s)",type(e).__name__)
@@ -643,25 +883,25 @@ def session_info():
 @app.route("/api/operator/login", methods=["POST"])
 def operator_login():
     if not OPERATOR_HTTPS_ENABLED or (not IS_DEVELOPMENT and not request.is_secure):
-        return jsonify({"error":"operator login requires HTTPS in deployment; set NEXALERT_HTTPS=1 behind a trusted TLS proxy"}),503
+        return jsonify({"error":"operator login requires the configured HTTPS listener"}),503
     data=request.get_json(silent=True)
-    if not isinstance(data,dict):return jsonify({"error":"request body must be an object"}),400
+    if not isinstance(data,dict):
+        record_security_event("operator_login", "malformed")
+        return jsonify({"error":"request body must be an object"}),400
     username=data.get("username"); password=data.get("password")
     if not isinstance(username,str) or not isinstance(password,str) or len(password)>1024:
+        record_security_event("operator_login", "failed")
         return jsonify({"error":"invalid credentials"}),401
     db=get_db(); user=db.execute("SELECT * FROM users WHERE username=? AND role='operator'",(username,)).fetchone()
-    if user and user["auth_locked_until"]:
-        locked=db.execute("SELECT auth_locked_until > datetime('now') FROM users WHERE id=?",(user["id"],)).fetchone()[0]
-        if locked:return jsonify({"error":"invalid credentials or account temporarily locked"}),401
     encoded=user["password_hash"] if user and user["password_hash"] else DUMMY_PASSWORD_HASH
     valid=check_password_hash(encoded,password)
     if not user or not user["password_hash"] or not valid:
-        if user:
-            db.execute("UPDATE users SET auth_failed_attempts=auth_failed_attempts+1,auth_locked_until=CASE WHEN auth_failed_attempts+1>=5 THEN datetime('now','+15 minutes') ELSE auth_locked_until END WHERE id=?",(user["id"],));db.commit()
-        return jsonify({"error":"invalid credentials or account temporarily locked"}),401
+        record_security_event("operator_login", "failed", user["id"] if user else None)
+        return jsonify({"error":"invalid credentials"}),401
     db.execute("UPDATE users SET auth_failed_attempts=0,auth_locked_until=NULL,session_version=session_version+1 WHERE id=?",(user["id"],));db.commit()
     updated=dict(db.execute("SELECT id,username,full_name,role,session_version FROM users WHERE id=?",(user["id"],)).fetchone())
     issue_session(updated)
+    record_security_event("operator_login", "success", user["id"])
     return jsonify({"status":"ok","user":public_identity(updated),"csrf_token":session["csrf_token"]})
 
 
@@ -669,7 +909,84 @@ def disconnect_user_sockets(user_id):
     for sid in tuple(ACTIVE_SOCKETS.get(user_id,set())):
         try: socketio.server.disconnect(sid,namespace="/")
         except Exception: pass
+        ACTIVE_SOCKET_IDENTITIES.pop(sid,None)
     ACTIVE_SOCKETS.pop(user_id,None)
+
+
+def _socket_identity():
+    # Socket.IO may retain Flask's request context between events. Do not trust
+    # a g-cached identity: reload the user and session version for every event.
+    g.pop("security_identity",None)
+    return authenticated_user()
+
+
+def emit_to_user(user_id,event,payload):
+    """Deliver only after revalidating every recipient's current DB session."""
+    _emit_to_authorized(event, payload, allowed_roles=None, user_ids={user_id})
+
+
+def emit_to_operators(event,payload):
+    _emit_to_authorized(event, payload, allowed_roles={"operator"})
+
+
+def _disconnect_socket(sid, user_id):
+    try:
+        socketio.server.disconnect(sid, namespace="/")
+    except Exception:
+        pass
+    ACTIVE_SOCKET_IDENTITIES.pop(sid, None)
+    sockets = ACTIVE_SOCKETS.get(user_id)
+    if sockets is not None:
+        sockets.discard(sid)
+        if not sockets:
+            ACTIVE_SOCKETS.pop(user_id, None)
+
+
+def socket_binding_is_current(sid, now=None, allowed_roles=None):
+    """Check expiry, database role/version, and the socket's immutable binding."""
+    binding = ACTIVE_SOCKET_IDENTITIES.get(sid)
+    if not binding:
+        return False
+    now = SOCKET_CLOCK() if now is None else now
+    if binding["expires_at"] <= now:
+        _disconnect_socket(sid, binding["user_id"])
+        return False
+    db = sqlite3.connect(DB_PATH); db.row_factory = sqlite3.Row
+    try:
+        row = db.execute("SELECT role,session_version FROM users WHERE id=?",(binding["user_id"],)).fetchone()
+    finally:
+        db.close()
+    if (not row or row["role"] != binding["role"] or
+        row["session_version"] != binding["session_version"]):
+        _disconnect_socket(sid, binding["user_id"])
+        return False
+    return True
+
+
+def _emit_to_authorized(event, payload, allowed_roles=None, user_ids=None):
+    """Never use a room broadcast for private, operator, or public push events."""
+    for user_id, sids in list(ACTIVE_SOCKETS.items()):
+        if user_ids is not None and user_id not in user_ids:
+            continue
+        for sid in tuple(sids):
+            if socket_binding_is_current(sid):
+                binding=ACTIVE_SOCKET_IDENTITIES.get(sid)
+                if allowed_roles is not None and (not binding or binding["role"] not in allowed_roles):
+                    continue
+                socketio.emit(event, payload, to=sid)
+
+
+def _reap_expired_sockets(now=None):
+    now = SOCKET_CLOCK() if now is None else now
+    for user_id, sids in list(ACTIVE_SOCKETS.items()):
+        for sid in tuple(sids):
+            socket_binding_is_current(sid, now=now)
+
+
+def _socket_reaper():
+    while True:
+        _reap_expired_sockets()
+        socketio.sleep(5)
 
 
 @app.route("/api/logout", methods=["POST"])
@@ -678,6 +995,8 @@ def logout():
     identity=authenticated_user(); db=get_db()
     db.execute("UPDATE users SET session_version=session_version+1 WHERE id=?",(identity["id"],));db.commit()
     disconnect_user_sockets(identity["id"])
+    if identity["role"] == "operator":
+        record_security_event("operator_logout", "success", identity["id"])
     session.clear();g.security_identity=None
     return jsonify({"status":"logged_out"})
 
@@ -715,19 +1034,49 @@ def update_location():
 # --- SOS ---
 @app.route("/api/sos", methods=["POST"])
 def create_sos():
-    data = request.get_json(silent=True) or {}
+    data = request.get_json(silent=True)
     if not isinstance(data, dict): return jsonify({"error":"request body must be a JSON object"}),400
     internal = secrets.compare_digest(request.headers.get("X-NexAlert-Internal", ""), INTERNAL_FORWARD_TOKEN)
     identity = authenticated_user()
-    if not internal and identity is None:return jsonify({"error":"authentication required"}),401
-    if not internal and identity["role"]!="citizen":return jsonify({"error":"citizen identity required"}),403
-    if any(k in data for k in ("user_id","owner_id")):
+    if not internal and identity is not None and identity["role"]!="citizen":return jsonify({"error":"citizen identity required"}),403
+    capability_hash=(data.get("incident_capability_hash") if internal else
+                     incident_capability_hash(request.headers.get("X-Incident-Capability", "")))
+    if capability_hash is not None and (not isinstance(capability_hash,str) or not re.fullmatch(r"[0-9a-f]{64}",capability_hash)):
+        return jsonify({"error":"invalid incident capability commitment"}),400
+    if not internal and identity is None and capability_hash is None:return jsonify({"error":"authentication or incident capability required"}),401
+    if capability_hash is None:return jsonify({"error":"incident capability is required"}),400
+    if any(k in data for k in ("user_id","owner_id")) or (not internal and any(k in data for k in ("owner_identity_id","ownership_state","ownership_issuer","ownership_assertion","ownership_assertion_digest","incident_capability_hash"))):
         return jsonify({"error":"incident owner comes from the authenticated session"}),400
-    username = data.get("username") if internal else identity["username"]
+    is_fallback=bool(internal and data.get("origin_mode")=="fallback")
+    owner_identity_id=identity["identity_id"] if identity and not internal else None
+    ownership_state="verified" if identity and not internal else "unclaimed"
+    ownership_issuer=None
+    ownership_digest=None
+    if is_fallback:
+        owner_identity_id=data.get("owner_identity_id")
+        assertion=data.get("ownership_assertion")
+        ownership_issuer=data.get("ownership_issuer")
+        ownership_state="unclaimed"
+        if owner_identity_id or assertion or ownership_issuer:
+            if not verify_ownership_assertion(
+            OWNERSHIP_ASSERTION_KEY,assertion,data.get("incident_id"),owner_identity_id,
+            ownership_issuer,PRIMARY_NODE_ID,data.get("source_node_id"),capability_hash):
+                return jsonify({"error":"fallback ownership assertion is invalid or out of scope"}),403
+            trusted=get_db().execute("SELECT id FROM users WHERE identity_id=? AND role='citizen'",(owner_identity_id,)).fetchone()
+            if trusted:
+                ownership_state="verified"
+                ownership_digest=__import__("hashlib").sha256(assertion.encode()).hexdigest()
+            else:
+                owner_identity_id=None
+    username = identity["username"] if identity else ("fallback-" + str(data.get("source_node_id") or "unclaimed"))
     alert_type  = data.get("alert_type", "other")
     raw_description=data.get("description", "")
     if raw_description is not None and not isinstance(raw_description,str): return jsonify({"error":"description must be text"}),400
     description = (raw_description or "").strip()
+    priority = data.get("priority", "critical")
+    priority_order = {"critical": 4, "high": 3, "moderate": 2, "routine": 1}
+    if not isinstance(priority, str) or priority not in priority_order:
+        return jsonify({"error": "priority must be critical, high, moderate or routine"}), 400
     raw_incident_id=data.get("incident_id", "")
     if raw_incident_id and not isinstance(raw_incident_id,str): return jsonify({"error":"incident_id must be text"}),400
     incident_id = (raw_incident_id or "").strip() or new_incident_id()
@@ -751,7 +1100,6 @@ def create_sos():
     except (TypeError, ValueError):
         return jsonify({"error": "latitude and longitude must be numbers"}), 400
 
-    if not isinstance(username,str): return jsonify({"error":"invalid internal source identity"}),400
     if not isinstance(alert_type,str) or alert_type not in ALERT_TYPES:
         return jsonify({"error": f"Unknown alert_type. Valid: {list(ALERT_TYPES.keys())}"}), 400
     if not re.fullmatch(r"INC-[A-Za-z0-9._-]{1,75}", incident_id):
@@ -766,42 +1114,64 @@ def create_sos():
         return jsonify({"error": "latitude or longitude is out of range"}), 400
 
     db = get_db()
-    user = db.execute("SELECT id FROM users WHERE username=?", (username,)).fetchone()
-    if not user:
-        if not internal:return jsonify({"error":"authenticated citizen record not found"}),401
-        db.execute("INSERT OR IGNORE INTO users(username,full_name,phone,role) VALUES(?,?,?,'citizen')", (username,"Fallback node",""))
-        db.commit()
-        user = db.execute("SELECT id FROM users WHERE username=?", (username,)).fetchone()
-    existing = db.execute("SELECT * FROM alerts WHERE idempotency_key=? OR incident_id=?", (idempotency_key, incident_id)).fetchone()
+    by_id=db.execute("SELECT * FROM alerts WHERE incident_id=?",(incident_id,)).fetchone()
+    by_key=db.execute("SELECT * FROM alerts WHERE idempotency_key=?",(idempotency_key,)).fetchone()
+    if by_id and by_key and by_id["incident_id"]!=by_key["incident_id"]:
+        return jsonify({"error":"idempotency key and incident ID refer to different reports"}),409
+    existing=by_id or by_key
+    user = None
+    if identity and not internal:
+        user=db.execute("SELECT id,username FROM users WHERE id=?",(identity["id"],)).fetchone()
+    elif ownership_state=="verified" and owner_identity_id:
+        user=db.execute("SELECT id,username FROM users WHERE identity_id=? AND role='citizen'",(owner_identity_id,)).fetchone()
+    if user is None and not existing:
+        unclaimed_name="nexalert-unclaimed"
+        db.execute("INSERT OR IGNORE INTO users(username,full_name,phone,role) VALUES(?,?,?,'citizen')",
+                   (unclaimed_name,"Unclaimed reports",""))
+        user=db.execute("SELECT id,username FROM users WHERE username=?",(unclaimed_name,)).fetchone()
+    elif user is None and existing:
+        user=db.execute("SELECT id,username FROM users WHERE id=?",(existing["user_id"],)).fetchone()
     if existing:
-        if existing["user_id"] != user["id"]:
-            return jsonify({"error": "incident_id belongs to another user"}), 409
+        if existing["incident_capability_hash"] != capability_hash:
+            record_security_event("incident_capability_rejected","conflict",identity["id"] if identity else None,incident_id)
+            return jsonify({"error":"incident capability does not match this report"}),404
+        if (is_fallback and ownership_state=="verified" and existing["ownership_state"]=="verified" and
+            existing["owner_identity_id"]!=owner_identity_id):
+            return jsonify({"error":"incident_id has conflicting verified ownership"}),409
+        if is_fallback and existing["ownership_state"]=="verified" and ownership_state!="verified":
+            return jsonify({"error":"unverified retry cannot replace established ownership"}),409
+        if is_fallback and existing["ownership_state"]=="unclaimed" and ownership_state=="verified":
+            db.execute("UPDATE alerts SET user_id=?,owner_identity_id=?,ownership_state='verified',ownership_issuer=?,ownership_assertion_digest=? WHERE incident_id=?",
+                       (user["id"],owner_identity_id,ownership_issuer,ownership_digest,incident_id));db.commit()
+            existing=db.execute("SELECT * FROM alerts WHERE incident_id=?",(incident_id,)).fetchone()
+            alert_row=existing;alert_id=existing["id"]
         alert_id = existing["id"]
         incident_id = existing["incident_id"]
         alert_row = existing
     else:
+        queued = db.execute("SELECT count(*) FROM outbound_queue WHERE state IN ('queued','retry')").fetchone()[0]
+        if queued >= 5000:
+            return jsonify({"error": "SOS queue is full; keep this report on this device and retry"}), 503
         cur = db.execute(
-            "INSERT INTO alerts (user_id, alert_type, description, latitude, longitude, incident_id, delivery_status, lifecycle_status, landmark, idempotency_key, source_node_id, origin_mode) "
-            "VALUES (?,?,?,?,?,?, 'saved_locally','saved_locally',?,?,?,?)",
-            (user["id"], alert_type, description, lat, lon, incident_id, landmark, idempotency_key, source_node_id, origin_mode)
+            "INSERT INTO alerts (user_id, alert_type, description, latitude, longitude, incident_id, delivery_status, lifecycle_status, landmark, idempotency_key, source_node_id, origin_mode,ownership_state,owner_identity_id,ownership_issuer,ownership_assertion_digest,priority,incident_capability_hash) "
+            "VALUES (?,?,?,?,?,?, 'saved_locally','saved_locally',?,?,?,?,?,?,?,?,?,?)",
+            (user["id"], alert_type, description, lat, lon, incident_id, landmark, idempotency_key, source_node_id, origin_mode,ownership_state,owner_identity_id,ownership_issuer,ownership_digest,priority,capability_hash)
         )
         alert_id = cur.lastrowid
         record_incident_event(db, incident_id, "saved_locally", "validated SOS persisted locally")
-        db.execute("INSERT INTO outbound_queue (incident_id, state) VALUES (?, 'queued')", (incident_id,))
+        db.execute("INSERT INTO outbound_queue (incident_id, state,priority) VALUES (?, 'queued',?)", (incident_id,priority_order[priority]))
         db.execute("UPDATE alerts SET delivery_status='queued' WHERE id=?", (alert_id,))
         record_incident_event(db, incident_id, "queued", "queued for transport")
         db.commit()
         alert_row = db.execute("SELECT * FROM alerts WHERE id=?", (alert_id,)).fetchone()
 
     # The transaction above completes before forwarding is attempted.
-    if transport.status().get("connected"):
-        transport.process_queue()
     alert_row = db.execute("SELECT * FROM alerts WHERE id=?", (alert_id,)).fetchone()
 
     alert_data = {
         "id":          alert_id,
         "incident_id": alert_row["incident_id"],
-        "username":    username,
+        "username":    user["username"] if user else username,
         "alert_type":  alert_row["alert_type"],
         "label":       ALERT_TYPES[alert_row["alert_type"]]["label"],
         "icon":        ALERT_TYPES[alert_row["alert_type"]]["icon"],
@@ -816,15 +1186,15 @@ def create_sos():
         "receipt_id": alert_row["receipt_id"],
         "source_node_id": alert_row["source_node_id"],
         "origin_mode": alert_row["origin_mode"],
+        "priority": alert_row["priority"],
     }
     # Full SOS details are restricted to authenticated operator sockets; the
     # submitting citizen receives only status for their own incident.
-    socketio.emit("new_alert", alert_data, room="operators")
-    if not internal:
-        socketio.emit("sos_status", {"incident_id":incident_id,
+    emit_to_operators("new_alert", alert_data)
+    if not internal and identity:
+        emit_to_user(identity["id"],"sos_status", {"incident_id":incident_id,
                                       "delivery_status":alert_row["delivery_status"],
-                                      "lifecycle_status":alert_row["lifecycle_status"]},
-                      room=f"user:{identity['id']}")
+                                      "lifecycle_status":alert_row["lifecycle_status"]})
     logger.info("SOS persisted: incident=%s type=%s", incident_id, alert_type)
     return jsonify({"status": "ok", "created": existing is None, "alert": alert_data}), 201 if existing is None else 200
 
@@ -864,7 +1234,7 @@ def resolve_alert(alert_id):
     record_incident_event(db,row["incident_id"],"resolved","operator recorded lifecycle event")
     write_operator_action(db,authenticated_user()["id"],"resolve",row["incident_id"],row["lifecycle_status"],"resolved")
     db.commit()
-    socketio.emit("alert_resolved", {"incident_id":row["incident_id"]},room="operators")
+    emit_to_operators("alert_resolved", {"incident_id":row["incident_id"]})
     return jsonify({"status": "ok"})
 
 
@@ -898,7 +1268,7 @@ def assign_responder(incident_id):
                           alert["lifecycle_status"],next_lifecycle)
     db.execute("INSERT INTO responder_assignments(incident_id,responder) VALUES(?,?) ON CONFLICT(incident_id) DO UPDATE SET responder=excluded.responder,assigned_at=datetime('now')", (incident_id, responder))
     db.commit()
-    socketio.emit("incident_updated", {"incident_id": incident_id},room="operators")
+    emit_to_operators("incident_updated", {"incident_id": incident_id})
     return jsonify({"status": "ok", "incident_id": incident_id, "lifecycle_status": next_lifecycle})
 
 
@@ -938,17 +1308,22 @@ def list_incidents():
     return jsonify(out)
 
 @app.route("/api/incidents/<incident_id>", methods=["GET"])
-@require_auth()
 def incident_detail(incident_id):
     identity=authenticated_user()
+    capability_hash=incident_capability_hash(request.headers.get("X-Incident-Capability", ""))
+    if identity is None and capability_hash is None:return jsonify({"error":"authentication or incident capability required"}),401
     query="SELECT * FROM alerts WHERE incident_id=?";params=[incident_id]
-    if identity["role"]!="operator":query+=" AND user_id=?";params.append(identity["id"])
+    if not identity or identity["role"]!="operator":
+        query+=" AND incident_capability_hash=?";params.append(capability_hash or "")
+        if identity:
+            query=query.replace("incident_capability_hash=?", "(incident_capability_hash=? OR user_id=?")
+            params.append(identity["id"]);query+=")"
     row=get_db().execute(query,params).fetchone()
     if not row: return jsonify({"error":"Incident not found"}),404
-    return jsonify({"incident":dict(row),"history":[dict(e) for e in get_db().execute("SELECT status,detail,created_at FROM incident_events WHERE incident_id=? ORDER BY id",(incident_id,))]})
+    incident=dict(row);incident.pop("incident_capability_hash",None)
+    return jsonify({"incident":incident,"history":[dict(e) for e in get_db().execute("SELECT status,detail,created_at FROM incident_events WHERE incident_id=? ORDER BY id",(incident_id,))]})
 
 @app.route("/api/incidents/<incident_id>/updates", methods=["POST"])
-@require_auth("citizen")
 def update_incident(incident_id):
     data=request.get_json(silent=True) or {}
     if not isinstance(data,dict): return jsonify({"error":"request body must be a JSON object"}),400
@@ -956,7 +1331,12 @@ def update_incident(incident_id):
     landmark=data.get('landmark')
     if description is not None and (not isinstance(description,str) or len(description)>1000): return jsonify({"error":"description must be up to 1000 characters"}),400
     if landmark is not None and (not isinstance(landmark,str) or len(landmark)>250): return jsonify({"error":"landmark must be up to 250 characters"}),400
-    db=get_db(); row=db.execute("SELECT id FROM alerts WHERE incident_id=? AND user_id=?",(incident_id,authenticated_user()["id"])).fetchone()
+    identity=authenticated_user()
+    capability_hash=incident_capability_hash(request.headers.get("X-Incident-Capability", ""))
+    if identity is None and capability_hash is None:return jsonify({"error":"authentication or incident capability required"}),401
+    if identity is not None and identity["role"]!="citizen":return jsonify({"error":"citizen identity required"}),403
+    db=get_db(); row=db.execute("SELECT id FROM alerts WHERE incident_id=? AND (incident_capability_hash=? OR user_id=?)",
+                                (incident_id,capability_hash or "",identity["id"] if identity else -1)).fetchone()
     if not row: return jsonify({"error":"Incident not found"}),404
     if description is not None: db.execute("UPDATE alerts SET description=? WHERE incident_id=?",(description.strip(),incident_id))
     if landmark is not None: db.execute("UPDATE alerts SET landmark=? WHERE incident_id=?",(landmark.strip(),incident_id))
@@ -987,7 +1367,7 @@ def advance_lifecycle(incident_id):
     record_incident_event(db,incident_id,target,"operator recorded lifecycle event")
     write_operator_action(db,authenticated_user()["id"],"lifecycle",incident_id,row["lifecycle_status"],target)
     db.commit()
-    socketio.emit("incident_updated",{"incident_id":incident_id},room="operators")
+    emit_to_operators("incident_updated",{"incident_id":incident_id})
     return jsonify({"status":"ok","incident_id":incident_id,"lifecycle_status":target})
 
 
@@ -1036,8 +1416,8 @@ def send_message():
         "content":content.strip(),"is_broadcast":False,
         "timestamp":   datetime.now().isoformat(),
     }
-    socketio.emit("new_message",msg,room=f"user:{recipient['id']}")
-    socketio.emit("new_message",msg,room=f"user:{identity['id']}")
+    emit_to_user(recipient["id"],"new_message",msg)
+    emit_to_user(identity["id"],"new_message",msg)
     return jsonify({"status": "ok", "message": msg}), 201
 
 
@@ -1089,7 +1469,7 @@ def create_announcement():
         "SELECT id,category,content,created_at FROM system_announcements WHERE id=?",
         (cur.lastrowid,),
     ).fetchone())
-    socketio.emit("system_announcement", announcement)
+    _emit_to_authorized("system_announcement", announcement, allowed_roles={"citizen"})
     return jsonify({"status": "persisted_local_broadcast", "announcement": announcement,
                     "delivery": "local_application_only"}), 201
 
@@ -1155,7 +1535,6 @@ def receive_failover_heartbeat():
 
 
 @app.route("/api/fallback/sos", methods=["POST"])
-@require_auth("citizen")
 def fallback_sos():
     if not failover_controller or not failover_controller.fallback_service_ready:
         return jsonify({"error": "local fallback service is not active"}), 503
@@ -1163,20 +1542,54 @@ def fallback_sos():
     if not isinstance(data, dict):
         return jsonify({"error": "request body must be a JSON object"}), 400
     report = dict(data)
-    if any(key in report for key in ("user_id","owner_id","username","role")):
+    if any(key in report for key in ("user_id","owner_id","username","role","owner_identity_id","ownership_state","ownership_issuer","ownership_assertion","incident_capability_hash")):
         return jsonify({"error":"fallback SOS identity comes from the authenticated session"}),400
     report.setdefault("incident_id", new_incident_id())
-    report["citizen_user_id"]=authenticated_user()["id"]
+    capability_hash=incident_capability_hash(request.headers.get("X-Incident-Capability", ""))
+    if capability_hash is None:
+        return jsonify({"error":"a valid incident capability is required"}),400
+    report["incident_capability_hash"]=capability_hash
+    citizen=authenticated_user()
+    identity_id=citizen["identity_id"] if citizen else None
+    existing=None
+    with fallback_store.connection() as fallback_db:
+        existing=fallback_db.execute("SELECT * FROM fallback_incidents WHERE incident_id=?",(report["incident_id"],)).fetchone()
+    capability_matches=bool(existing and existing["incident_capability_hash"] and
+        hmac.compare_digest(existing["incident_capability_hash"],capability_hash))
+    if capability_matches:
+        # A retry with the incident capability reuses the stored trust decision;
+        # session loss or a new login must not downgrade or reassign ownership.
+        for field in ("owner_identity_id","ownership_state","ownership_issuer","ownership_assertion","ownership_assertion_digest"):
+            report[field]=existing[field]
+    else:
+        report.update({"owner_identity_id":None,"ownership_state":"unclaimed",
+                       "ownership_issuer":None,"ownership_assertion":None,
+                       "ownership_assertion_digest":None})
+    provisioned=bool(identity_id and fallback_store.trusts_citizen(identity_id))
+    if not capability_matches and provisioned:
+        report.update({"owner_identity_id":identity_id,"ownership_state":"verified",
+            "ownership_issuer":FALLBACK_NODE_ID})
+        report["ownership_assertion"]=sign_ownership_assertion(
+            OWNERSHIP_ASSERTION_KEY,report["incident_id"],identity_id,FALLBACK_NODE_ID,
+            PRIMARY_NODE_ID,FALLBACK_NODE_ID,capability_hash)
+        report["ownership_assertion_digest"]=__import__("hashlib").sha256(report["ownership_assertion"].encode()).hexdigest()
+    elif not capability_matches:
+        report.update({"owner_identity_id":None,"ownership_state":"unclaimed",
+                       "ownership_issuer":None,"ownership_assertion":None,
+                       "ownership_assertion_digest":None})
+    # Node-local IDs remain local metadata and are never included in the sync payload.
+    report["citizen_user_id"]=(existing["citizen_user_id"] if capability_matches else (citizen["id"] if citizen else None))
     try:
-        accepted, created = fallback_store.accept(report, "esp32-backup-sim", time.time())
+        accepted, created = fallback_store.accept(report, FALLBACK_NODE_ID, time.time())
     except FailoverError as exc:
         return jsonify({"error": str(exc)}), 400
-    socketio.emit("fallback_sos_accepted", {"incident_id": accepted["incident_id"], "origin_mode": "fallback"},room="operators")
+    emit_to_operators("fallback_sos_accepted", {"incident_id": accepted["incident_id"], "origin_mode": "fallback"})
     receipt = accepted.get("command_receipt_id")
     delivery = "received_by_command_centre" if receipt else "queued_on_backup"
+    public_incident={key:accepted.get(key) for key in ("incident_id","source_node_id","alert_type","created_at","local_receipt_id","outbox_state","command_receipt_id")}
     return jsonify({"status": "accepted_locally", "created": created,
                     "delivery_status": delivery, "command_centre_receipt": receipt,
-                    "incident": accepted}), 201 if created else 200
+                    "incident": public_incident}), 201 if created else 200
 
 
 @app.route("/api/fallback/incidents", methods=["GET"])
@@ -1184,7 +1597,29 @@ def fallback_sos():
 def fallback_incidents_for_citizen():
     if fallback_store is None:
         return jsonify([])
-    return jsonify(fallback_store.incidents_for_user(authenticated_user()["id"]))
+    identity=authenticated_user()
+    capability_hash=incident_capability_hash(request.headers.get("X-Incident-Capability", ""))
+    if identity is None and capability_hash is None:return jsonify({"error":"authentication or incident capability required"}),401
+    rows=fallback_store.incidents_for_user(identity["identity_id"]) if identity else []
+    return jsonify(rows)
+
+
+@app.route("/api/fallback/incidents/<incident_id>", methods=["GET"])
+def fallback_incident_detail(incident_id):
+    if fallback_store is None:return jsonify({"error":"Incident not found"}),404
+    capability_hash=incident_capability_hash(request.headers.get("X-Incident-Capability", ""))
+    identity=authenticated_user()
+    with fallback_store.connection() as db:
+        row=db.execute("SELECT * FROM fallback_incidents WHERE incident_id=?",(incident_id,)).fetchone()
+        if not row:return jsonify({"error":"Incident not found"}),404
+        allowed=(capability_hash is not None and row["incident_capability_hash"]==capability_hash) or (
+            identity is not None and identity["identity_id"]==row["owner_identity_id"] and row["ownership_state"]=="verified")
+        if not allowed:return jsonify({"error":"Incident not found"}),404
+        outbox=db.execute("SELECT state,command_receipt_id FROM fallback_outbox WHERE incident_id=?",(incident_id,)).fetchone()
+        return jsonify({"incident_id":incident_id,"alert_type":row["alert_type"],"description":row["description"],
+                        "latitude":row["latitude"],"longitude":row["longitude"],"landmark":row["landmark"],
+                        "delivery_status":"received_by_command_centre" if outbox["state"]=="received" else "queued_on_backup",
+                        "receipt_id":outbox["command_receipt_id"]})
 
 
 def _forward_fallback_report(report):
@@ -1200,17 +1635,38 @@ def _forward_fallback_report(report):
         conn = open_db_connection()
         conn.execute("UPDATE simulated_transport_config SET lose_next_ack=1 WHERE singleton=1")
         conn.commit(); conn.close()
-    username = "fallback-" + report["source_node_id"]
-    payload = {"username": username, "incident_id": report["incident_id"],
+    payload = {"incident_id": report["incident_id"],
         "idempotency_key": report["incident_id"], "alert_type": report["alert_type"],
         "description": report["description"], "latitude": report["latitude"],
         "longitude": report["longitude"], "landmark": report["landmark"],
-        "origin_mode": "fallback", "source_node_id": report["source_node_id"]}
+        "origin_mode": "fallback", "source_node_id": report["source_node_id"],
+        "owner_identity_id":report.get("owner_identity_id"),
+        "ownership_state":report.get("ownership_state","unclaimed"),
+        "ownership_issuer":report.get("ownership_issuer"),
+        "ownership_assertion":report.get("ownership_assertion"),
+        "incident_capability_hash":report.get("incident_capability_hash")}
     with app.test_client() as client:
         response = client.post("/api/sos", json=payload, headers={"X-NexAlert-Internal": INTERNAL_FORWARD_TOKEN})
         body = response.get_json(silent=True) or {}
     if response.status_code not in (200, 201):
         return ForwardResult(False, detail=body.get("error", "primary rejected fallback report"))
+    # Failover synchronisation is an operator-controlled recovery operation.
+    # After the primary has durably accepted the report, its worker step commits
+    # the independent command-centre record before the fallback outbox is acked.
+    retry_db = open_db_connection()
+    retry_db.execute("UPDATE outbound_queue SET next_attempt_at='' WHERE incident_id=? AND state IN ('queued','retry')",
+                     (report["incident_id"],))
+    retry_db.commit()
+    retry_db.close()
+    transport.process_queue(limit=1)
+    sender = open_db_connection()
+    try:
+        saved = sender.execute("SELECT delivery_status,receipt_id FROM alerts WHERE incident_id=?",
+                               (report["incident_id"],)).fetchone()
+        if saved:
+            body.setdefault("alert", {}).update(dict(saved))
+    finally:
+        sender.close()
     alert = body.get("alert", {})
     if alert.get("delivery_status") == "received_by_command_centre" and alert.get("receipt_id"):
         return ForwardResult(True, alert["receipt_id"])
@@ -1287,10 +1743,10 @@ def sync_contacts():
         phone = (c.get("phone") or "").strip()
         if not name or not phone:
             continue
-        # check if this contact is on the network
-        net_user = db.execute("SELECT id FROM users WHERE phone=?", (phone,)).fetchone()
-        on_net   = 1 if net_user else 0
-        net_uid  = net_user["id"] if net_user else None
+        # Phone-number matching disclosed account existence to callers. Keep
+        # address-book data private and never resolve it against user records.
+        on_net = 0
+        net_uid = None
         db.execute(
             """INSERT OR IGNORE INTO contacts (owner_id, contact_name, contact_phone, on_network, network_user_id)
                VALUES (?, ?, ?, ?, ?)""",
@@ -1299,7 +1755,7 @@ def sync_contacts():
     db.commit()
 
     rows = db.execute(
-        "SELECT id,contact_name,contact_phone,on_network FROM contacts WHERE owner_id=?", (user_id,)
+        "SELECT id,contact_name,contact_phone,0 AS on_network FROM contacts WHERE owner_id=?", (user_id,)
     ).fetchall()
     return jsonify([dict(r) for r in rows])
 
@@ -1337,8 +1793,8 @@ def post_environmental():
         (temp, hum, aq, batt, solar)
     )
     db.commit()
-    socketio.emit("env_update", {"temperature": temp, "humidity": hum,
-                                  "air_quality": aq, "battery_v": batt, "solar_v": solar},room="operators")
+    emit_to_operators("env_update", {"temperature": temp, "humidity": hum,
+                                  "air_quality": aq, "battery_v": batt, "solar_v": solar})
     return jsonify({"status": "ok"}), 201
 
 
@@ -1421,20 +1877,29 @@ def apply_security_headers(response):
 
 @socketio.on("connect")
 def on_connect():
-    identity=authenticated_user()
+    global SOCKET_REAPER_STARTED
+    identity=_socket_identity()
     if identity is None:return False
+    expires_at=session.get("session_expires_at")
+    if not isinstance(expires_at,(int,float)) or expires_at<=time.time():return False
     user_id=identity["id"];sid=request.sid
     join_room(f"user:{user_id}")
     if identity["role"]=="operator":join_room("operators")
     ACTIVE_SOCKETS.setdefault(user_id,set()).add(sid)
+    ACTIVE_SOCKET_IDENTITIES[sid]={"user_id":user_id,"session_version":identity["session_version"],
+                                  "role":identity["role"],"expires_at":float(expires_at)}
+    if not SOCKET_REAPER_STARTED and not app.testing:
+        socketio.start_background_task(_socket_reaper)
+        SOCKET_REAPER_STARTED=True
     db=get_db();db.execute("UPDATE users SET is_online=1,last_seen=datetime('now') WHERE id=?",(user_id,));db.commit()
-    socketio.emit("user_online",{"username":identity["username"]},room="operators")
+    emit_to_operators("user_online",{"username":identity["username"]})
     logger.info("Authenticated socket connected: user_id=%s",user_id)
 
 
 @socketio.on("disconnect")
 def on_disconnect():
     user_id=session.get("user_id")
+    ACTIVE_SOCKET_IDENTITIES.pop(request.sid,None)
     if isinstance(user_id,int):
         ACTIVE_SOCKETS.get(user_id,set()).discard(request.sid)
         if not ACTIVE_SOCKETS.get(user_id):
@@ -1444,29 +1909,29 @@ def on_disconnect():
                 if user_id in {call["caller_id"],call["callee_id"]}:
                     ACTIVE_CALLS.pop(key,None)
                     other=call["callee_id"] if call["caller_id"]==user_id else call["caller_id"]
-                    socketio.emit("call:ended",{"from":str(user_id)},room=f"user:{other}")
-            socketio.emit("user_offline",{"user_id":user_id},room="operators")
+                    emit_to_user(other,"call:ended",{"from":str(user_id)})
+            emit_to_operators("user_offline",{"user_id":user_id})
 
 
 @socketio.on("join")
 def on_join(data):
     """Rooms are assigned at connect and cannot be selected by clients."""
-    if authenticated_user() is None:disconnect()
+    if _socket_identity() is None:disconnect()
 
 
 @socketio.on("typing")
 def on_typing(data):
-    sender=authenticated_user();recipient=data.get("recipient") if isinstance(data,dict) else None
+    sender=_socket_identity();recipient=data.get("recipient") if isinstance(data,dict) else None
     if sender is None:disconnect();return
     if not isinstance(recipient,str):return
     peer=get_db().execute("SELECT id FROM users WHERE username=? AND role='citizen'",(recipient,)).fetchone()
     if peer and peer["id"] in ACTIVE_SOCKETS:
-        emit("typing",{"from":sender["username"]},room=f"user:{peer['id']}")
+        emit_to_user(peer["id"],"typing",{"from":sender["username"]})
 
 
 def _call_identity(data):
     """Resolve call participants from live, authenticated server identities."""
-    sender=authenticated_user()
+    sender=_socket_identity()
     target = data.get("to") if isinstance(data, dict) else None
     if sender is None or sender["role"]!="citizen" or not isinstance(target,str) or not target or target==sender["username"]:
         return None,None
@@ -1486,7 +1951,7 @@ def on_call_invite(data):
         emit("call:error", {"message": "Participant is already in a call"})
         return
     ACTIVE_CALLS[key] = {"caller":sender["username"],"callee":target["username"],"caller_id":sender["id"],"callee_id":target["id"],"state":"ringing"}
-    socketio.emit("call:invite", {"from": sender["username"]}, room=f"user:{target['id']}")
+    emit_to_user(target["id"],"call:invite", {"from": sender["username"]})
 
 
 @socketio.on("call:accept")
@@ -1497,7 +1962,7 @@ def on_call_accept(data):
         emit("call:error", {"message": "Call participant is unavailable"})
         return
     call["state"] = "active"
-    socketio.emit("call:accepted", {"from": sender["username"]}, room=f"user:{target['id']}")
+    emit_to_user(target["id"],"call:accepted", {"from": sender["username"]})
 
 
 @socketio.on("call:decline")
@@ -1507,7 +1972,7 @@ def on_call_decline(data):
     call = ACTIVE_CALLS.get(key) if key else None
     if call and call["caller"] == target["username"] and call["callee"] == sender["username"] and call["state"] == "ringing":
         ACTIVE_CALLS.pop(key, None)
-        socketio.emit("call:declined", {"from": sender["username"]}, room=f"user:{target['id']}")
+        emit_to_user(target["id"],"call:declined", {"from": sender["username"]})
 
 
 @socketio.on("call:signal")
@@ -1519,7 +1984,7 @@ def on_call_signal(data):
     if not call or call["state"] != "active" or kind not in {"offer", "answer", "ice"} or not isinstance(signal, dict):
         emit("call:error", {"message": "Invalid call signal or unavailable participant"})
         return
-    socketio.emit("call:signal", {"from": sender["username"], "kind": kind, "data": signal}, room=f"user:{target['id']}")
+    emit_to_user(target["id"],"call:signal", {"from": sender["username"], "kind": kind, "data": signal})
 
 
 @socketio.on("call:end")
@@ -1528,13 +1993,37 @@ def on_call_end(data):
     key = _call_key(sender["username"], target["username"]) if sender and target else None
     if key and key in ACTIVE_CALLS:
         ACTIVE_CALLS.pop(key, None)
-        socketio.emit("call:ended", {"from": sender["username"]}, room=f"user:{target['id']}")
+        emit_to_user(target["id"],"call:ended", {"from": sender["username"]})
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    # Socket identity/session state is process local. Enforce the supported
+    # one-web-process topology for this SQLite deployment rather than allowing
+    # accidental multi-worker execution on the same database.
+    app_lock_path = os.environ.get("NEXALERT_APP_LOCK", DB_PATH + ".app.lock")
+    app_lock = open(app_lock_path, "a+")
+    if os.name == "nt":
+        import msvcrt
+        app_lock.seek(0, os.SEEK_END)
+        if app_lock.tell() == 0:
+            app_lock.write("0"); app_lock.flush()
+        app_lock.seek(0)
+        try:
+            msvcrt.locking(app_lock.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError as exc:
+            raise SystemExit("another NexAlert web process holds the database lock") from exc
+    else:
+        import fcntl
+        try:
+            fcntl.flock(app_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise SystemExit("another NexAlert web process holds the database lock") from exc
     init_db()
-    host=os.environ.get("NEXALERT_HOST","0.0.0.0")
+    host=os.environ.get("NEXALERT_HOST", "127.0.0.1" if not IS_DEVELOPMENT else "0.0.0.0")
     port=int(os.environ.get("NEXALERT_PORT","5000"))
+    validate_production_tls_config(host)
+    if not IS_DEVELOPMENT and port != 5000:
+        raise SystemExit("production reverse-proxy integration expects the loopback application port 5000")
     logger.info("NexAlert v3.0 starting on %s:%s",host,port)
     socketio.run(app, host=host, port=port, debug=False, allow_unsafe_werkzeug=True)

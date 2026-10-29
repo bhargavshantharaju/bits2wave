@@ -34,6 +34,14 @@ python backend\app.py
 
 On Linux/macOS, use `NEXALERT_ENV=development python backend/app.py`.
 
+SOS submission only persists and queues the report; delivery runs in a separate worker. Start exactly one worker against the same environment and database paths:
+
+```sh
+NEXALERT_ENV=development python -m backend.worker
+```
+
+The worker's host-local lock rejects a second worker using the same database path. Multi-process web deployments and multiple worker hosts are not supported by this prototype.
+
 PowerShell database configuration uses distinct files:
 
 ```powershell
@@ -45,37 +53,63 @@ Open `http://localhost:5000/` for the citizen interface and `http://localhost:50
 
 ### Security setup and limits
 
-Public onboarding creates a random, temporary pseudonymous citizen identity and an authenticated browser session. A display name is never an account credential. Clearing browser cookies or losing the device session loses access to that identity; registering again creates a different identity, and the server does not recover it from a name. Citizens can submit SOS reports and access only their own incidents and private messages. Operators are created explicitly by an administrator; public registration cannot select a role.
+Public onboarding creates a random, temporary pseudonymous citizen identity and an authenticated browser session. A stable internal UUID distinguishes identity from node-local SQLite row IDs. A display name is never an account credential. Clearing browser cookies loses access to that temporary identity and its session-backed features; registering again creates a different identity, and the server does not recover it from a name. Accepted incidents have a separate per-incident recovery capability stored in browser local storage. Citizens can submit SOS reports and access only their own incidents and private messages. Operators are created explicitly by an administrator; public registration cannot select a role.
 
-Provision an operator on the host that will run NexAlert (use the same database path and deployment secret as the application):
+Provision an operator on the host that will run NexAlert (use the same database paths and deployment keys as the application):
 
 ```sh
 export NEXALERT_ENV=production
 export NEXALERT_SECRET="$(python -c 'import secrets; print(secrets.token_urlsafe(48))')"
+export NEXALERT_BACKUP_OWNERSHIP_KEY="$(openssl rand -hex 32)"
 python -m backend.manage_operator --username dispatcher
 ```
 
-The command prompts twice for a password (at least 12 characters) and stores only a password hash. Keep the generated secret in a protected service environment or secret manager; do not commit it. Deployment startup refuses a missing or short `NEXALERT_SECRET`. Operator login requires HTTPS in deployment mode. For a TLS reverse proxy, set `NEXALERT_HTTPS=1`; set `NEXALERT_TRUST_PROXY=1` only when the application is reachable solely through a trusted proxy that overwrites forwarded-protocol headers. Set secure database paths using `NEXALERT_DB`, `NEXALERT_CC_DB`, and `NEXALERT_FALLBACK_DB` as needed.
+Persist both values securely and configure the application service with the exact same values; do not regenerate them on each start. The backup ownership key is distinct from the session secret and must also match the provisioned fallback node's key.
 
-For local development only, launch with `NEXALERT_ENV=development python backend/app.py`. Development generates an ephemeral session secret if none is configured and permits operator login over HTTP; existing sessions become invalid after restart. Do not expose this mode to shared or untrusted networks. HTTP does not encrypt passwords, cookies, CSRF tokens, emergency reports, locations or messages and cannot prevent local-network interception or modification. Authentication and access controls do not provide transport confidentiality. Private messages are not end-to-end encrypted. Session revocation uses a database-backed version checked on protected requests and socket events; logout also disconnects sockets known to the current process. This prototype is not represented as production-secure.
+The command prompts twice for a password (at least 12 characters) and stores only a scrypt hash. It refuses to convert a citizen account into an operator. Keep the application secret in a protected service environment; do not commit it. Deployment startup refuses a missing or short `NEXALERT_SECRET`. For production the Flask app binds to `127.0.0.1:5000` and requires a configured TLS reverse proxy certificate/key plus `NEXALERT_TRUSTED_PROXY_ADDRESS=127.0.0.1`; the old `NEXALERT_HTTPS` and `NEXALERT_TRUST_PROXY` switches are rejected/ignored as unsafe. A loopback-only Nginx template is at [deploy/nginx/nexalert-operator.conf.example](deploy/nginx/nexalert-operator.conf.example). It is suitable for local administration or SSH port forwarding; exposing a listener to an operator network requires an explicit interface and firewall decision. Self-signed certificates are not trusted automatically by phones or browsers. Set separate sender, receiver and fallback database paths as needed.
+
+Fallback ownership assertions use a unique per-backup `NEXALERT_BACKUP_OWNERSHIP_KEY` of at least 32 bytes, installed on that backup and its primary. Generate it out of band (for example `openssl rand -hex 32`) and protect it as a node credential; compromise of a backup permits false assertions for known citizen UUIDs. The assertion covers the stable incident ID, identity UUID, issuer, audience, node ID and SHA-256 commitment to the incident recovery capability. The bearer capability itself stays on the user's device and is never copied into the command-centre database or synchronization payload. It proves control of that report capability, not a real-world identity. On plain HTTP the bearer can be intercepted on the local network; hashing it at rest does not protect transport. The UI stores the recovery key in browser local storage; clearing storage or losing the device loses access, with no username-based recovery. Same-device session expiry does not remove access while the key remains. A replacement identity cannot claim the old incident; recovery without the capability requires operator review. New citizens without provisioned identity evidence can still submit but remain unclaimed during fallback.
+
+For local development only, launch with `NEXALERT_ENV=development python backend/app.py`. Development generates an ephemeral session secret and node assertion key if none is configured, and permits operator login over HTTP; do not expose this mode to shared or untrusted networks. Production operator login and all session-backed citizen features require trusted HTTPS because cookies are Secure. A site-local certificate authority or certificate must be installed and trusted on each device; generating a self-signed certificate alone does not establish trust. Plain HTTP exposes reports, coordinates and bearer recovery keys to interception and modification. Private messages are not end-to-end encrypted. Protected socket pushes revalidate the database role, session version and fixed expiry for each recipient; a five-second reaper closes expired sockets. The deployment supports one web process, enforced with a database-adjacent process lock; multi-worker serving is unsupported. The simulated transport remains default and radio transmission is disabled. Passing tests are not physical or production security validation.
+
+For a protected-host operator session, create a local-only certificate whose SAN includes `localhost`, install it under the paths in the Nginx template, set `NEXALERT_TLS_CERT`, `NEXALERT_TLS_KEY`, and `NEXALERT_TRUSTED_PROXY_ADDRESS=127.0.0.1`, then run the app bound to loopback. A remote administrator can use an SSH tunnel to local port 5443. For field devices, an administrator must deliberately configure a protected operator-only interface, matching DNS/certificate SAN, firewall policy and trusted CA onboarding; this repository does not alter host networking or claim phone trust validation. Rotate certificates before expiry and retain a tested out-of-band host recovery path. Operator password recovery is local host administration: rerun `python -m backend.manage_operator --username NAME` from the host to rotate an existing operator credential, which revokes sessions; no remote unauthenticated reset exists.
+
+Example offline certificate preparation (keep the CA private key offline and tightly protected; copy only the CA certificate to trusted operator devices):
+
+```sh
+umask 077
+mkdir -p ~/nexalert-tls
+cd ~/nexalert-tls
+openssl req -x509 -newkey rsa:3072 -sha256 -days 3650 -nodes \
+  -keyout local-ca.key -out local-ca.crt -subj "/CN=NexAlert Local CA"
+openssl req -new -newkey rsa:2048 -nodes -keyout operator.key \
+  -out operator.csr -subj "/CN=localhost"
+printf 'subjectAltName=DNS:localhost\nextendedKeyUsage=serverAuth\n' > operator.ext
+openssl x509 -req -in operator.csr -CA local-ca.crt -CAkey local-ca.key \
+  -CAcreateserial -out operator.crt -days 365 -sha256 -extfile operator.ext
+```
+
+Install `operator.crt` and `operator.key` at the certificate paths configured in Nginx and set the same paths as `NEXALERT_TLS_CERT`/`NEXALERT_TLS_KEY`. Set `NEXALERT_TRUSTED_PROXY_ADDRESS=127.0.0.1`, a strong `NEXALERT_SECRET`, and a unique strong `NEXALERT_BACKUP_OWNERSHIP_KEY` for the production configuration (protect and provision it separately from the TLS and session keys). Import `local-ca.crt` into each operator device's trust store, then browse to `https://localhost:5443` through an SSH local-forward such as `ssh -L 5443:127.0.0.1:5443 operator@pi-host`. Browsers may require a restart after CA installation. If trust fails, stop operator use and restore the prior valid certificate out of band; do not bypass the browser warning. Rotate the leaf certificate before expiry and repeat trust verification. Self-signed/locally issued certificate generation does not automatically make it trusted.
 
 `docs/security-baseline.md` documents route access, socket audiences, historical data handling, and remaining limitations.
+
+See [the current software completion matrix](docs/software-completion-matrix.md), [software architecture and SOS sequence](docs/software-architecture.md), and [radio protocol status](docs/protocol-status.md) for current evidence and explicit blockers. The existing radio codec is CRC-only protocol v1 scaffolding and is not safe as a firmware contract.
 
 ### Current software architecture and demo
 
 - The existing Flask API and citizen/dashboard pages remain. The citizen shell has a service-worker cache and keeps pending browser submissions with their incident key in local storage; server-side SQLite remains the durable sender queue once a request reaches Flask.
-- `alerts` retains existing incidents and adds location, idempotency, delivery, receipt timestamp, lifecycle and assignment fields through additive startup migration. `outbound_queue`, `delivery_attempts` and `incident_events` persist transport progress and history.
-- `SimulatedTransport` writes to a separate receiver SQLite database. Receiver incident and receipt rows commit before sender state is marked received. Failed sends, disconnects and lost acknowledgements are retryable; duplicate destination writes are suppressed by primary keys.
+- `alerts` retains existing incidents and adds location, idempotency, delivery, receipt timestamp, lifecycle, assignment, stable owner UUID and ownership-verification fields through additive startup migration. Legacy ownership remains unverified. `outbound_queue`, `delivery_attempts` and `incident_events` persist transport progress and history.
+- `SimulatedTransport` writes to a separate receiver SQLite database. Receiver incident and receipt rows commit before sender state is marked received. Citizen HTTP requests return after local persistence and queueing; run the separate `backend.worker` process for delivery. Failed sends, disconnects and lost acknowledgements are retryable; duplicate destination writes are suppressed by primary keys.
 - Delivery status is independent of operational lifecycle. Operators can assign, dispatch, mark arrival, and resolve in validated order. Assignment does not imply dispatch.
 - Development controls are available at `POST /api/transport/simulated` in tests/debug or when both `NEXALERT_ENV=development` and `NEXALERT_ENABLE_SIM_CONTROLS=1` are set. They are disabled by default and the control flag alone does not enable them.
 
-To reproduce the simulated workflow after dependencies are installed: launch the app with `NEXALERT_ENV=development NEXALERT_ENABLE_SIM_CONTROLS=1`; disconnect with `curl -X POST localhost:5000/api/transport/simulated -H 'Content-Type: application/json' -d '{"connected":false}'`; submit a citizen SOS; stop and restart Flask; confirm transport remains disconnected and the report remains queued; reconnect with `{"connected":true}`; confirm the incident appears on `/dashboard` as received; then assign a responder and separately use Dispatch, Mark arrived, and Resolve. To demonstrate a lost receipt, first set `{"lose_next_ack":true}`, submit SOS, observe it remains queued despite receiver persistence, then retry/reconnect and observe the same incident receives its stored receipt. Direct simulated delivery has no relay hop, so it never claims `relayed`; that state is reserved for a future transport that returns a real relay receipt. `{"fail_next_transmission":true}` demonstrates a failed send retained for retry.
+To reproduce the simulated workflow, launch both the app and one worker with `NEXALERT_ENV=development NEXALERT_ENABLE_SIM_CONTROLS=1`; disconnect using the simulated transport control, submit an SOS, stop and restart Flask, confirm that it remains queued, reconnect, and let the worker process it. A command-centre receipt is shown only after the receiver SQLite commit. Direct simulated delivery has no relay hop, so it never claims `relayed`. A failure remains recoverable through the bounded retry policy; after its retry ceiling it requires operator recovery.
 
 For just the HTTP portion of verification, run `python scripts/e2e_http_smoke.py`. It selects a temporary port and temporary sender, receiver and fallback databases. It also confirms the production database remains unchanged when that file happens to exist locally.
 
 ### Verification and capability boundary
 
-**Implemented in source:** optional SOS coordinates/landmark, stable incident and idempotency key, browser retry storage, SQLite sender queue, separate simulated receiver/receipt, follow-up details, restored four-tab citizen UI, local dashboard broadcasts, persisted status summaries, session-bound WebRTC signalling, status history and operator transitions. The local WebSocket client implements only the Engine.IO v4 / Socket.IO event subset used by this app; API reads remain HTTP-based. Run `python scripts/verify.py` for the current test count and HTTP smoke verification. Browser/device layout, actual microphone permission/media, offline tile coverage, and service-worker behavior with the browser fully offline still require browser validation. The reference screenshot directory was absent from this checkout, so pixel-level comparison could not be done. The project database and dated backups must remain protected; tests use temporary SQLite files.
+**Implemented in source:** optional SOS coordinates/landmark, stable incident and idempotency key, browser retry storage, SQLite sender queue, separate simulated receiver/receipt, follow-up details, local dashboard broadcasts, session-bound WebRTC signalling, status history and operator transitions. The local WebSocket client implements only the Engine.IO v4 / Socket.IO event subset used by this app; API reads remain HTTP-based. Run `python scripts/verify.py` for the verification workflow. This remains a prototype with material software gaps. See [the completion matrix](docs/software-completion-matrix.md) for evidence and blockers. The project database and dated backups must remain protected; tests use temporary SQLite files.
 
 **Simulated only:** disconnect/reconnect, direct simulated delivery, failed send, lost acknowledgement, receiver persistence and receipt. The direct simulator has no relay hop. No physical LoRa, real mesh/failover, actual captive-portal behavior on hardware, government alert integration, 48-hour battery life or 100-client capacity is implemented or claimed. Phase 2 begins at the `SosTransport` boundary: replace/add a real transport adapter with radio framing, addressing/routing, retry/ACK semantics, hardware gateway integration and field validation while retaining the incident IDs, durable queue, receiver commit-before-receipt contract and dashboard/API lifecycle.
 

@@ -168,7 +168,12 @@ class FallbackStore:
                     alert_type TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
                     latitude REAL, longitude REAL, landmark TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL, local_receipt_id TEXT NOT NULL UNIQUE,
-                    citizen_user_id INTEGER);
+                    citizen_user_id INTEGER, owner_identity_id TEXT,
+                    ownership_state TEXT NOT NULL DEFAULT 'unclaimed',
+                    ownership_issuer TEXT, ownership_assertion TEXT,
+                    ownership_assertion_digest TEXT,incident_capability_hash TEXT);
+                CREATE TABLE IF NOT EXISTS fallback_trusted_citizens(
+                    identity_id TEXT PRIMARY KEY, provisioned_at TEXT NOT NULL DEFAULT(datetime('now')));
                 CREATE TABLE IF NOT EXISTS fallback_outbox(
                     incident_id TEXT PRIMARY KEY REFERENCES fallback_incidents(incident_id),
                     state TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
@@ -188,6 +193,23 @@ class FallbackStore:
             columns={row[1] for row in db.execute("PRAGMA table_info(fallback_incidents)")}
             if "citizen_user_id" not in columns:
                 db.execute("ALTER TABLE fallback_incidents ADD COLUMN citizen_user_id INTEGER")
+            for name,decl in (("owner_identity_id","TEXT"),("ownership_state","TEXT NOT NULL DEFAULT 'unclaimed'"),
+                              ("ownership_issuer","TEXT"),("ownership_assertion","TEXT"),
+                              ("ownership_assertion_digest","TEXT"),
+                              ("incident_capability_hash","TEXT")):
+                if name not in columns:
+                    db.execute(f"ALTER TABLE fallback_incidents ADD COLUMN {name} {decl}")
+
+    def provision_citizen(self, identity_id: str) -> None:
+        """Install a primary-provisioned stable identity in the offline allowlist."""
+        if not isinstance(identity_id,str) or not re.fullmatch(r"[0-9a-f-]{36}",identity_id):
+            raise FailoverError("invalid stable citizen identity")
+        with self.connection() as db:
+            db.execute("INSERT OR IGNORE INTO fallback_trusted_citizens(identity_id) VALUES(?)",(identity_id,))
+
+    def trusts_citizen(self, identity_id: str) -> bool:
+        with self.connection() as db:
+            return bool(db.execute("SELECT 1 FROM fallback_trusted_citizens WHERE identity_id=?",(identity_id,)).fetchone())
 
     def connect(self):
         db = sqlite3.connect(self.path, timeout=10)
@@ -241,6 +263,23 @@ class FallbackStore:
         citizen_user_id=report.get("citizen_user_id")
         if citizen_user_id is not None and (isinstance(citizen_user_id,bool) or not isinstance(citizen_user_id,int) or citizen_user_id<1):
             raise FailoverError("citizen identity is invalid")
+        owner_identity_id=report.get("owner_identity_id")
+        owner_assertion=report.get("ownership_assertion")
+        ownership_state=report.get("ownership_state","unclaimed")
+        ownership_issuer=report.get("ownership_issuer")
+        assertion_digest=report.get("ownership_assertion_digest")
+        capability_hash=report.get("incident_capability_hash")
+        if capability_hash is not None and (not isinstance(capability_hash,str) or not re.fullmatch(r"[0-9a-f]{64}",capability_hash)):
+            raise FailoverError("incident capability commitment is invalid")
+        if ownership_state not in {"verified","unclaimed"}:
+            raise FailoverError("invalid ownership state")
+        if ownership_state=="verified" and not all(isinstance(x,str) and x for x in (owner_identity_id,owner_assertion,ownership_issuer,assertion_digest)):
+            raise FailoverError("verified ownership requires a complete assertion")
+        if ownership_state=="verified":
+            with self.connection() as trust_db:
+                trusted=trust_db.execute("SELECT 1 FROM fallback_trusted_citizens WHERE identity_id=?",(owner_identity_id,)).fetchone()
+            if not trusted or not hmac.compare_digest(hashlib.sha256(owner_assertion.encode()).hexdigest(),assertion_digest):
+                raise FailoverError("ownership is not backed by provisioned evidence")
         created_at = created_at or __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat()
         local_receipt = "LOCAL-" + incident_id
         db = self.connect()
@@ -250,16 +289,20 @@ class FallbackStore:
             if before:
                 if before["source_node_id"] != source_node_id:
                     raise FailoverError("incident_id already belongs to another source node")
-                if before["citizen_user_id"] != citizen_user_id:
-                    raise FailoverError("incident_id already belongs to another citizen")
+                if (before["owner_identity_id"] != owner_identity_id or
+                    before["ownership_assertion_digest"] != assertion_digest or
+                    before["incident_capability_hash"] != capability_hash):
+                    raise FailoverError("incident_id has conflicting ownership evidence")
                 db.commit()
                 status = db.execute("SELECT state,command_receipt_id FROM fallback_outbox WHERE incident_id=?", (incident_id,)).fetchone()
                 return self._local_response(before, status["state"], status["command_receipt_id"]), False
             db.execute("""INSERT INTO fallback_incidents
-                (incident_id,source_node_id,alert_type,description,latitude,longitude,landmark,created_at,local_receipt_id,citizen_user_id)
-                VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                (incident_id,source_node_id,alert_type,description,latitude,longitude,landmark,created_at,local_receipt_id,citizen_user_id,
+                 owner_identity_id,ownership_state,ownership_issuer,ownership_assertion,ownership_assertion_digest,incident_capability_hash)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (incident_id, source_node_id, alert_type, description.strip(), lat, lon,
-                 landmark.strip(), created_at, local_receipt, citizen_user_id))
+                 landmark.strip(), created_at, local_receipt, citizen_user_id,owner_identity_id,
+                 ownership_state,ownership_issuer,owner_assertion,assertion_digest,capability_hash))
             db.execute("INSERT INTO fallback_outbox(incident_id,state,last_attempt_at) VALUES(?,'pending',NULL)", (incident_id,))
             row = db.execute("SELECT * FROM fallback_incidents WHERE incident_id=?", (incident_id,)).fetchone()
             db.commit()
@@ -276,6 +319,10 @@ class FallbackStore:
                 "alert_type": row["alert_type"], "description": row["description"],
                 "latitude": row["latitude"], "longitude": row["longitude"],
                 "landmark": row["landmark"], "created_at": row["created_at"],
+                "owner_identity_id": row["owner_identity_id"],"ownership_state":row["ownership_state"],
+                "ownership_issuer":row["ownership_issuer"],"ownership_assertion":row["ownership_assertion"],
+                "ownership_assertion_digest":row["ownership_assertion_digest"],
+                "incident_capability_hash":row["incident_capability_hash"],
                 "local_receipt_id": row["local_receipt_id"], "outbox_state": state,
                 "command_receipt_id": command_receipt_id}
 
@@ -284,11 +331,11 @@ class FallbackStore:
             rows = db.execute("SELECT i.*,o.attempts FROM fallback_incidents i JOIN fallback_outbox o USING(incident_id) WHERE o.state='pending' ORDER BY i.created_at,i.incident_id").fetchall()
             return [dict(row) for row in rows]
 
-    def incidents_for_user(self, citizen_user_id: int):
+    def incidents_for_user(self, identity_id: str):
         with self.connection() as db:
             rows=db.execute("""SELECT i.*,o.state,o.command_receipt_id FROM fallback_incidents i
-                JOIN fallback_outbox o USING(incident_id) WHERE i.citizen_user_id=?
-                ORDER BY i.created_at DESC""",(citizen_user_id,)).fetchall()
+                JOIN fallback_outbox o USING(incident_id) WHERE i.owner_identity_id=? AND i.ownership_state='verified'
+                ORDER BY i.created_at DESC""",(identity_id,)).fetchall()
             return [{"incident_id":r["incident_id"],"source_node_id":r["source_node_id"],
                      "alert_type":r["alert_type"],"description":r["description"],
                      "latitude":r["latitude"],"longitude":r["longitude"],"landmark":r["landmark"],
@@ -346,6 +393,32 @@ class FallbackStore:
     def recent_events(self, limit=50):
         with self.connection() as db:
             return [dict(row) for row in db.execute("SELECT * FROM failover_events ORDER BY id DESC LIMIT ?", (limit,)).fetchall()]
+
+
+def ownership_assertion_bytes(incident_id: str, identity_id: str, issuer: str,
+                              audience: str, source_node_id: str,
+                              incident_capability_hash: str = "") -> bytes:
+    return json.dumps(["nexalert-owner-v2",incident_id,identity_id,issuer,audience,source_node_id,
+                       incident_capability_hash],
+                      separators=(",",":"),ensure_ascii=True).encode("ascii")
+
+
+def sign_ownership_assertion(key: bytes, incident_id: str, identity_id: str,
+                             issuer: str, audience: str, source_node_id: str,
+                             incident_capability_hash: str = "") -> str:
+    return hmac.new(key,ownership_assertion_bytes(incident_id,identity_id,issuer,audience,source_node_id,
+                                                  incident_capability_hash),
+                    hashlib.sha256).hexdigest()
+
+
+def verify_ownership_assertion(key: bytes, assertion: str, incident_id: str,
+                               identity_id: str, issuer: str, audience: str,
+                               source_node_id: str,incident_capability_hash: str = "") -> bool:
+    if not isinstance(assertion,str):
+        return False
+    expected=sign_ownership_assertion(key,incident_id,identity_id,issuer,audience,source_node_id,
+                                      incident_capability_hash)
+    return hmac.compare_digest(expected,assertion)
 
 
 @dataclass(frozen=True)

@@ -6,7 +6,8 @@ import unittest
 
 from backend.failover import (FailoverController, FailoverError, FailoverState,
                               FallbackStore, FallbackSynchronizer, ForwardResult,
-                              Heartbeat, HeartbeatMonitor)
+                              Heartbeat, HeartbeatMonitor, sign_ownership_assertion)
+import hashlib
 
 
 class FakeClock:
@@ -100,6 +101,45 @@ class FailoverTests(unittest.TestCase):
         self.assertFalse(created)
         self.assertEqual(first["incident_id"], again["incident_id"])
         self.assertEqual(self.store.pending_count(), 1)
+
+    def test_preprovisioned_ownership_assertion_survives_store_restart_and_conflicts_fail_closed(self):
+        identity="12345678-1234-4234-8234-123456789abc"
+        conflicting="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        self.store.provision_citizen(identity);self.store.provision_citizen(conflicting)
+        assertion=sign_ownership_assertion(self.key,"INC-owner-restart",identity,
+            "esp32-sim","pi-primary","esp32-sim")
+        report={**self.report("INC-owner-restart"),"citizen_user_id":7,
+            "owner_identity_id":identity,"ownership_state":"verified",
+            "ownership_issuer":"esp32-sim","ownership_assertion":assertion,
+            "ownership_assertion_digest":hashlib.sha256(assertion.encode()).hexdigest()}
+        self.store.accept(report,"esp32-sim",self.clock())
+        restarted=FallbackStore(self.path)
+        recovered=restarted.pending()[0]
+        self.assertEqual(recovered["owner_identity_id"],identity)
+        self.assertEqual(recovered["ownership_state"],"verified")
+        conflict_assertion=sign_ownership_assertion(self.key,"INC-owner-restart",conflicting,
+            "esp32-sim","pi-primary","esp32-sim")
+        conflicting_report={**report,"owner_identity_id":conflicting,
+            "ownership_assertion":conflict_assertion,
+            "ownership_assertion_digest":hashlib.sha256(conflict_assertion.encode()).hexdigest()}
+        with self.assertRaises(FailoverError):
+            restarted.accept(conflicting_report,"esp32-sim",self.clock())
+        self.assertEqual(restarted.pending()[0]["owner_identity_id"],identity)
+
+    def test_ownership_assertion_is_bound_to_incident_issuer_audience_and_node(self):
+        from backend.failover import verify_ownership_assertion
+        tag=sign_ownership_assertion(self.key,"INC-bound","12345678-1234-4234-8234-123456789abc",
+            "backup-a","primary-a","backup-a")
+        args=(self.key,tag,"INC-bound","12345678-1234-4234-8234-123456789abc")
+        self.assertTrue(verify_ownership_assertion(*args,"backup-a","primary-a","backup-a"))
+        self.assertFalse(verify_ownership_assertion(*args,"backup-a","primary-a","backup-b"))
+        self.assertFalse(verify_ownership_assertion(self.key,tag,"INC-other",args[3],"backup-a","primary-a","backup-a"))
+        self.assertFalse(verify_ownership_assertion(*args,"backup-b","primary-a","backup-a"))
+        self.assertFalse(verify_ownership_assertion(*args,"backup-a","primary-b","backup-a"))
+        commitment="a"*64
+        bound=sign_ownership_assertion(self.key,"INC-bound",args[3],"backup-a","primary-a","backup-a",commitment)
+        self.assertTrue(verify_ownership_assertion(self.key,bound,"INC-bound",args[3],"backup-a","primary-a","backup-a",commitment))
+        self.assertFalse(verify_ownership_assertion(self.key,bound,"INC-bound",args[3],"backup-a","primary-a","backup-a","b"*64))
 
     def test_fallback_rows_and_runtime_survive_restart(self):
         self.activate()

@@ -1,0 +1,21 @@
+# Copy to the system's nginx sites-enabled directory after reviewing paths.
+# This template listens on loopback only. Use an SSH tunnel for remote admin,
+# or explicitly bind a second listener to a protected operator-only interface.
+server {
+    listen 127.0.0.1:5443 ssl;
+    server_name localhost;
+    ssl_certificate     /etc/nexalert/tls/operator.crt;
+    ssl_certificate_key /etc/nexalert/tls/operator.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    client_max_body_size 64k;
+
+    location / {
+        proxy_pass http://127.0.0.1:5000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+    }
+}

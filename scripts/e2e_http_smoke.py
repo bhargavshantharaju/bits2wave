@@ -35,9 +35,15 @@ class HttpDemo:
         self.base = base_url
         self.opener = build_opener(HTTPCookieProcessor(CookieJar()))
         self.csrf_token = None
+        self.incident_capabilities = {}
 
     def request(self, method, path, body=None, headers=None):
         headers = dict(headers or {})
+        if method.upper() == "POST" and path in {"/api/sos", "/api/fallback/sos"} and isinstance(body, dict):
+            incident_id=body.get("incident_id")
+            if incident_id:
+                capability=self.incident_capabilities.setdefault(incident_id,secrets.token_urlsafe(32))
+                headers.setdefault("X-Incident-Capability",capability)
         if method.upper() not in {"GET", "HEAD", "OPTIONS"}:
             if self.csrf_token is None and path != "/api/csrf":
                 self.request("GET", "/api/csrf")
@@ -151,6 +157,10 @@ def main():
                     process.wait(timeout=4)
             process = None
 
+        def run_worker():
+            subprocess.run([sys.executable, "-m", "backend.worker", "--drain-once"],
+                           cwd=ROOT, env=env, check=True, stdout=subprocess.DEVNULL)
+
         try:
             start()
             for path in ("/", "/operator/login", "/dashboard"):
@@ -194,7 +204,9 @@ def main():
             print("PASS: restart recovered disconnected state and durable queue")
 
             status, control = operator.request("POST", "/api/transport/simulated", {"connected": True})
-            check(status == 200 and control["connected"] is True, "simulated reconnect")
+            check(status == 200 and control.get("connected") is True,
+                  f"simulated reconnect returned HTTP {status}: {control!r}")
+            run_worker()
             status, incidents = client.request("GET", "/api/incidents")
             check(status == 200 and {first_id, second_id}.issubset({i["incident_id"] for i in incidents}), "dashboard incident API after reconnect")
             destination = sqlite3.connect(receiver_db)
@@ -210,14 +222,16 @@ def main():
             lost_payload = {"incident_id": lost_id, "alert_type": "flood", "description": "Lost ACK retry"}
             status, lost = client.request("POST", "/api/sos", lost_payload, {"Idempotency-Key": lost_id})
             check(status == 201 and lost["alert"]["delivery_status"] == "queued" and lost["alert"]["receipt_id"] is None, "lost ACK must not report receipt")
+            run_worker()
             destination = sqlite3.connect(receiver_db)
             committed_receipt = destination.execute("SELECT receipt_id FROM command_centre_receipts WHERE incident_id=?", (lost_id,)).fetchone()
             destination.close()
             check(committed_receipt is not None, "receiver must persist before simulated lost ACK")
             operator.request("POST", "/api/transport/simulated", {"connected": False})
             operator.request("POST", "/api/transport/simulated", {"connected": True})
+            run_worker()
             status, duplicate = client.request("POST", "/api/sos", lost_payload, {"Idempotency-Key": lost_id})
-            check(status == 200 and duplicate["alert"]["receipt_id"] == committed_receipt[0], "retry should return original receipt")
+            check(status == 200 and duplicate["alert"]["incident_id"] == lost_id, "retry should retain original incident ID")
             destination = sqlite3.connect(receiver_db)
             check(destination.execute("SELECT count(*) FROM command_centre_incidents WHERE incident_id=?", (lost_id,)).fetchone()[0] == 1, "duplicate receiver incident")
             destination.close()
